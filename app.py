@@ -337,7 +337,16 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
         - MEDIUM: 10-30% deviation, 2 violations, or score >= 0.25
         - LOW: <10% deviation, 1 violation, or score < 0.25
         
+        CONFIDENCE CALCULATION:
+        Calculate confidence as a percentage based on the anomaly score:
+        - If anomaly_score >= 0.8: 90-99%
+        - If anomaly_score >= 0.6: 70-85%
+        - If anomaly_score >= 0.4: 50-70%
+        - If anomaly_score >= 0.2: 30-50%
+        - If anomaly_score < 0.2: 10-30%
+        
         PRE-CLASSIFIED SEVERITY: {calculated_severity}
+        ANOMALY SCORE: {anomaly_details.get('anomaly_score', 0):.2f}
         Strictly assign severity level that matches or stays close to this pre-classification.
 
         Important:
@@ -347,7 +356,7 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
         1. "alert_title": Short title (e.g., "ESP Motor Current Spike").
         2. "severity": Assign based on severity matrix above (CRITICAL, HIGH, MEDIUM, or LOW).
         3. "status": "ACTIVE".
-        4. "confidence": Percentage string (e.g., "94%").
+        4. "confidence": IMPORTANT - Percentage string (e.g., "65%") calculated from anomaly score. MUST be between 10% and 99%. DO NOT always return 100%. Use the confidence calculation guide above.
         5. "description": Write a concise, technical paragraph. Within this paragraph, you MUST clearly describe each parameter from 'Violations Detected' that is out of range.
             For each parameter, state the nature of the anomaly by including its observed value and the expected range, both with their units.
             For example: "The motor temperature reached 265 °C, exceeding the expected operational range of 100–250 °C."
@@ -739,6 +748,8 @@ def get_well_history(well_id):
 
             for _, row in anomalies_df.iterrows():
                 record = row.to_dict()
+                # Replace NaN and inf values with None for JSON serialization
+                record = {k: (None if pd.isna(v) or (isinstance(v, float) and np.isinf(v)) else v) for k, v in record.items()}
                 if 'timestamp' in record:
                     record['timestamp'] = str(record['timestamp'])
                 suggestions_list.append({
@@ -755,6 +766,8 @@ def get_well_history(well_id):
         readings_list = []
         for _, row in readings_df.iterrows():
             record = row.to_dict()
+            # Replace NaN and inf values with None for JSON serialization
+            record = {k: (None if pd.isna(v) or (isinstance(v, float) and np.isinf(v)) else v) for k, v in record.items()}
             if 'timestamp' in record:
                 record['timestamp'] = str(record['timestamp'])
             readings_list.append(record)

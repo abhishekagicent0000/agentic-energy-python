@@ -91,11 +91,11 @@ WELL_TYPE_RULES = {
         "motor_voltage": {"min": 400, "max": 480},  # 400-480V
     },
     "Gas Lift": {
-        "injection_rate": {"min": 2, "max": 20},  # 2-20 MMscf/d
-        "injection_temperature": {"min": 20, "max": 80},  # 20-80°C
-        "bottomhole_pressure": {"min": 1000, "max": 3500},  # 1000-3500 PSI
-        "injection_pressure": {"min": 500, "max": 2000},  # 500-2000 PSI
-        "cycle_time": {"min": 10, "max": 120},  # 10-120 seconds
+        "injection_rate": {"min": 0, "max": 2000},  # 0-2000 scf/d
+        "injection_temperature": {"min": 0, "max": 1000},  # 0-1000°F
+        "bottomhole_pressure": {"min": 50, "max": 5000},  # 50-5000 PSI
+        "injection_pressure": {"min": 100, "max": 5000},  # 100-5000 PSI
+        "cycle_time": {"min": 5, "max": 180},  # 5-180 minutes
     }
 }
 
