@@ -1,0 +1,98 @@
+{
+  "Rod Pump": {
+    "isolation_forest": {
+      "precision": 0.75,
+      "recall": 1.0,
+      "f1": 0.8571428571428571,
+      "true_positives": 9,
+      "false_positives": 3,
+      "false_negatives": 0,
+      "true_negatives": 79,
+      "auc_roc": 0.006775067750677513
+    },
+    "statistical": {
+      "precision": 1.0,
+      "recall": 0.1111111111111111,
+      "f1": 0.2,
+      "true_positives": 1,
+      "false_positives": 0,
+      "false_negatives": 8,
+      "true_negatives": 82,
+      "auc_roc": 0.9552845528455285
+    },
+    "training_samples": 360,
+    "test_samples": 91,
+    "features": [
+      "strokes_per_minute",
+      "torque",
+      "polish_rod_load",
+      "pump_fillage",
+      "tubing_pressure"
+    ],
+    "timestamp": "2026-01-12T18:25:00.510947"
+  },
+  "ESP": {
+    "isolation_forest": {
+      "precision": 0.8333333333333334,
+      "recall": 0.8333333333333334,
+      "f1": 0.8333333333333334,
+      "true_positives": 15,
+      "false_positives": 3,
+      "false_negatives": 3,
+      "true_negatives": 160,
+      "auc_roc": 0.005453306066802999
+    },
+    "statistical": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "true_positives": 0,
+      "false_positives": 0,
+      "false_negatives": 18,
+      "true_negatives": 163,
+      "auc_roc": 0.8945126107702794
+    },
+    "training_samples": 721,
+    "test_samples": 181,
+    "features": [
+      "motor_temp",
+      "motor_current",
+      "discharge_pressure",
+      "pump_intake_pressure",
+      "motor_voltage"
+    ],
+    "timestamp": "2026-01-12T18:25:01.053622"
+  },
+  "Gas Lift": {
+    "isolation_forest": {
+      "precision": 0.7,
+      "recall": 0.7777777777777778,
+      "f1": 0.7368421052631579,
+      "true_positives": 7,
+      "false_positives": 3,
+      "false_negatives": 2,
+      "true_negatives": 79,
+      "auc_roc": 0.01897018970189702
+    },
+    "statistical": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "true_positives": 0,
+      "false_positives": 0,
+      "false_negatives": 9,
+      "true_negatives": 82,
+      "auc_roc": 0.9261517615176151
+    },
+    "training_samples": 360,
+    "test_samples": 91,
+    "features": [
+      "injection_rate",
+      "injection_temperature",
+      "bottomhole_pressure",
+      "injection_pressure",
+      "cycle_time"
+    ],
+    "timestamp": "2026-01-12T18:25:01.546780"
+  }
+}

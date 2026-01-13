@@ -1,0 +1,85 @@
+{
+  "family": "at-risk-assets",
+  "executionRoleArn": "arn:aws:iam::200937443240:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "200937443240.dkr.ecr.us-east-1.amazonaws.com/at-risk-assets:latest",
+      "portMappings": [
+        {
+          "containerPort": 5000,
+          "hostPort": 5000,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [],
+      "secrets": [
+        {
+          "name": "SNOWFLAKE_USER",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/snowflake_user-ZwHki7"
+        },
+        {
+          "name": "SNOWFLAKE_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/snowflake_password-zoxbVb"
+        },
+        {
+          "name": "SNOWFLAKE_ACCOUNT",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/snowflake_account-ffpTs0"
+        },
+        {
+          "name": "SNOWFLAKE_WAREHOUSE",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/snowflake_warehouse-bjvW3N"
+        },
+        {
+          "name": "SNOWFLAKE_DATABASE",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/snowflake_database-2gkewV"
+        },
+        {
+          "name": "SNOWFLAKE_SCHEMA",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/snowflake_schema-vkv373"
+        },
+        {
+          "name": "SNOWFLAKE_ROLE",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/snowflake_role-V4qzXx"
+        },
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/openai_api_key-1taXgu"
+        },
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/database_url-WtJr57"
+        },
+        {
+          "name": "FLASK_ENV",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/flask_env-KooLu7"
+        },
+        {
+          "name": "PYTHONUNBUFFERED",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/python_unbuffered-Q4vhPF"
+        },
+        {
+          "name": "OPENAI_API_BASE",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/openai_api_base-cgghzF"
+        },
+        {
+          "name": "OPENAI_MODEL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:200937443240:secret:at-risk-assets/openai_model-XnTcN2"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/at-risk-assets",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

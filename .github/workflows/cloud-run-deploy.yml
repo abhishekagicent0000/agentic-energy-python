@@ -1,0 +1,59 @@
+name: Build and Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: gcr.io
+  IMAGE_NAME: at-risk-assets-app
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --tag ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push to Google Container Registry
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy at-risk-assets \
+            --image ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --platform managed \
+            --region us-central1 \
+            --memory 2Gi \
+            --cpu 2 \
+            --set-env-vars SNOWFLAKE_USER=${{ secrets.SNOWFLAKE_USER }},SNOWFLAKE_PASSWORD=${{ secrets.SNOWFLAKE_PASSWORD }},SNOWFLAKE_ACCOUNT=${{ secrets.SNOWFLAKE_ACCOUNT }},SNOWFLAKE_WAREHOUSE=${{ secrets.SNOWFLAKE_WAREHOUSE }},SNOWFLAKE_DATABASE=${{ secrets.SNOWFLAKE_DATABASE }},SNOWFLAKE_SCHEMA=${{ secrets.SNOWFLAKE_SCHEMA }},SNOWFLAKE_ROLE=${{ secrets.SNOWFLAKE_ROLE }} \
+            --allow-unauthenticated
+
+      - name: Output Cloud Run URL
+        run: |
+          echo "Service deployed successfully!"
+          gcloud run services describe at-risk-assets --platform managed --region us-central1 --format='value(status.url)'
