@@ -1,7 +1,7 @@
 """
 Unified Anomaly Detection Module
 Integrates statistical rules, Isolation Forest, and LSTM for comprehensive anomaly detection.
-Replaces hardcoded RULES in app.py with data-driven detection from Excel.
+Loads sensor configurations dynamically from Snowflake instead of hardcoding.
 """
 
 import pandas as pd
@@ -13,6 +13,13 @@ import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import joblib
+
+try:
+    from dynamic_config import get_sensor_ranges, get_anomaly_rules
+    DYNAMIC_CONFIG_AVAILABLE = True
+except ImportError:
+    DYNAMIC_CONFIG_AVAILABLE = False
+    logging.warning("dynamic_config module not available; using fallback rules")
 
 try:
     from sklearn.ensemble import IsolationForest
@@ -36,10 +43,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configuration
-EXCEL_FILE = 'data types and ranges.xlsx'
 ROLLING_WINDOWS = [1, 3, 6, 12]  # Hours
 ANOMALY_THRESHOLD = 0.75
 WEIGHTS = {'rules': 0.4, 'iso': 0.3, 'lstm': 0.3}
+# Minimum ML-only score required to flag an anomaly when no rule violations exist
+ML_ONLY_ANOMALY_THRESHOLD = 0.85
 
 # Fallback for when PyTorch is not available
 class FakeLSTMModule:
@@ -74,59 +82,36 @@ else:
             return x
 
 
-# Well-type aware rules (based on actual Excel data)
-WELL_TYPE_RULES = {
-    "Rod Pump": {
-        "strokes_per_minute": {"min": 5, "max": 25},  # Realistic range
-        "torque": {"min": 100, "max": 5000},  # Realistic range
-        "polish_rod_load": {"min": 500, "max": 10000},  # Realistic range
-        "pump_fillage": {"min": 20, "max": 100},  # 20-100%
-        "tubing_pressure": {"min": 100, "max": 3000},  # 100-3000 PSI
-    },
-    "ESP": {
-        "motor_temp": {"min": 50, "max": 150},  # 50-150°C
-        "motor_current": {"min": 50, "max": 200},  # 50-200A
-        "discharge_pressure": {"min": 1000, "max": 4500},  # 1000-4500 PSI
-        "pump_intake_pressure": {"min": 100, "max": 1000},  # 100-1000 PSI
-        "motor_voltage": {"min": 400, "max": 480},  # 400-480V
-    },
-    "Gas Lift": {
-        "injection_rate": {"min": 0, "max": 2000},  # 0-2000 scf/d
-        "injection_temperature": {"min": 0, "max": 1000},  # 0-1000°F
-        "bottomhole_pressure": {"min": 50, "max": 5000},  # 50-5000 PSI
-        "injection_pressure": {"min": 100, "max": 5000},  # 100-5000 PSI
-        "cycle_time": {"min": 5, "max": 180},  # 5-180 minutes
-    }
-}
+# Dynamic rules loader function
+def get_well_type_rules(lift_type):
+    """Get sensor rules for a well type from dynamic config (Snowflake)."""
+    if not DYNAMIC_CONFIG_AVAILABLE:
+        raise ValueError("Dynamic config not available. Ensure Snowflake is configured and tables are created.")
+    
+    try:
+        ranges = get_sensor_ranges(lift_type)
+        rules = {}
+        for field_name, range_info in ranges.items():
+            rules[field_name] = {
+                "min": range_info.get('min'),
+                "max": range_info.get('max')
+            }
+        return rules
+    except Exception as e:
+        logger.error(f"Error loading dynamic rules for {lift_type}: {e}")
+        raise
 
-UNITS_MAP = {
-    "strokes_per_minute": "SPM",
-    "torque": "in-lbs",
-    "polish_rod_load": "lbs",
-    "pump_fillage": "%",
-    "tubing_pressure": "psi",
-    "motor_temp": "°F",
-    "motor_current": "A",
-    "discharge_pressure": "psi",
-    "pump_intake_pressure": "psi",
-    "motor_voltage": "V",
-    "injection_rate": "scf/d",
-    "injection_temperature": "°F",
-    "bottomhole_pressure": "psi",
-    "injection_pressure": "psi",
-    "cycle_time": "minutes",
-    "oil_volume": "bbl",
-    "gas_volume": "mcf",
-    "water_volume": "bbl",
-}
+
 
 
 class AnomalyDetector:
     """Unified anomaly detection combining rules, Isolation Forest, and LSTM."""
     
-    def __init__(self, excel_file: str = EXCEL_FILE):
-        """Initialize detector with rules from Excel or fallback defaults."""
-        self.rules = self._load_rules_from_excel(excel_file)
+    def __init__(self):
+        """Initialize detector with rules from dynamic Snowflake config."""
+        if not DYNAMIC_CONFIG_AVAILABLE:
+            raise RuntimeError("Dynamic config (Snowflake) is required. Ensure tables are created with create_dynamic_config.py")
+        
         self.iso_model = None
         self.lstm_model = None
         self.lstm_scaler = None
@@ -134,7 +119,7 @@ class AnomalyDetector:
         # Load pre-trained models from model_training.py
         self.trained_models = self._load_trained_models()
         
-        logger.info(f"✓ Anomaly detector initialized with {len(self.rules)} rules")
+        logger.info(f"✓ Anomaly detector initialized (using dynamic Snowflake config)")
         if self.trained_models:
             logger.info(f"✓ Loaded trained models: {', '.join(self.trained_models.keys())}")
     
@@ -169,134 +154,13 @@ class AnomalyDetector:
         
         return trained_models
     
-    def _load_rules_from_excel(self, excel_file: str) -> Dict:
-        """Load rules from Excel file, fallback to defaults if file not found."""
-        rules = {}
-        
-        try:
-            if not os.path.exists(excel_file):
-                logger.warning(f"Excel file {excel_file} not found; using default rules")
-                return self._get_default_rules()
-            
-            df = pd.read_excel(excel_file, header=None, engine='openpyxl')
-            
-            # Parse header rows
-            categories = df.iloc[1].ffill() if len(df) > 1 else []
-            data_names = df.iloc[2].fillna("Unknown") if len(df) > 2 else []
-            
-            # Find range row
-            range_row_idx = None
-            try:
-                range_row_idx = df[df[0].astype(str).str.lower().str.contains("range", na=False)].index[0]
-            except (IndexError, TypeError):
-                logger.warning("Could not find 'range' row in Excel; using defaults")
-                return self._get_default_rules()
-            
-            ranges = df.iloc[range_row_idx]
-            
-            # Extract rules
-            for i in range(1, len(data_names)):
-                raw_name = str(data_names[i])
-                rng_str = str(ranges[i]) if i < len(ranges) else ""
-                parsed = self._parse_range(rng_str)
-                
-                if parsed:
-                    db_col = self._normalize_column_name(raw_name)
-                    if db_col:
-                        rules[db_col] = {
-                            "min": parsed['min'],
-                            "max": parsed['max'],
-                            "norm_min": parsed.get('norm_min', parsed['min']),
-                            "norm_max": parsed.get('norm_max', parsed['max']),
-                        }
-            
-            if rules:
-                logger.info(f"✓ Loaded {len(rules)} rules from Excel: {', '.join(rules.keys())}")
-                return rules
-            else:
-                logger.warning("No rules parsed from Excel; using defaults")
-                return self._get_default_rules()
-                
-        except Exception as e:
-            logger.error(f"Error loading Excel rules: {e}; using defaults")
-            return self._get_default_rules()
+
     
-    def _parse_range(self, range_str: str) -> Optional[Dict]:
-        """Parse range string like '100-200' or '100-200 150-180' into min/max."""
-        if not isinstance(range_str, str):
-            return None
-        
-        range_str = range_str.strip()
-        pairs = re.findall(r"([\d,.]+)\s*-\s*([\d,.]+)", range_str)
-        
-        if not pairs:
-            return None
-        
-        def to_float(s):
-            try:
-                return float(s.replace(',', ''))
-            except:
-                return 0.0
-        
-        vals = [(to_float(a), to_float(b)) for a, b in pairs]
-        
-        if not vals:
-            return None
-        
-        abs_min, abs_max = vals[0]
-        norm_min, norm_max = vals[1] if len(vals) > 1 else (abs_min, abs_max)
-        
-        # Ensure Min < Max
-        if abs_min > abs_max:
-            abs_min, abs_max = abs_max, abs_min
-        if norm_min > norm_max:
-            norm_min, norm_max = norm_max, norm_min
-        
-        return {
-            "min": abs_min,
-            "max": abs_max,
-            "norm_min": norm_min,
-            "norm_max": norm_max
-        }
+
     
-    def _normalize_column_name(self, raw_name: str) -> Optional[str]:
-        """Map Excel column names to database column names."""
-        if not isinstance(raw_name, str):
-            return None
-        
-        raw_name = str(raw_name).strip()
-        
-        if "Tubing" in raw_name and "Pressure" in raw_name:
-            return "tubing_pressure"
-        elif "Casing" in raw_name and "Pressure" in raw_name:
-            return "casing_pressure"
-        elif "Surface" in raw_name and "Pressure" in raw_name:
-            return "surface_pressure"
-        elif "Pump Intake" in raw_name and "Pressure" in raw_name:
-            return "surface_pressure"
-        elif "Motor" in raw_name and "Temp" in raw_name:
-            return "motor_temp"
-        elif "Discharge" in raw_name and "Temp" in raw_name:
-            return "wellhead_temp"
-        elif "Intake" in raw_name and "Temp" in raw_name:
-            return "wellhead_temp"
-        elif "Fluid" in raw_name and "Temp" in raw_name:
-            return "wellhead_temp"
-        elif "Motor" in raw_name and "Current" in raw_name:
-            return "motor_current"
-        
-        return None
+
     
-    def _get_default_rules(self) -> Dict:
-        """Return default hardcoded rules if Excel loading fails."""
-        return {
-            "surface_pressure": {"min": 100, "max": 400, "norm_min": 100, "norm_max": 400},
-            "tubing_pressure": {"min": 200, "max": 600, "norm_min": 200, "norm_max": 600},
-            "casing_pressure": {"min": 300, "max": 800, "norm_min": 300, "norm_max": 800},
-            "motor_temp": {"min": 100, "max": 250, "norm_min": 100, "norm_max": 250},
-            "wellhead_temp": {"min": 50, "max": 200, "norm_min": 50, "norm_max": 200},
-            "motor_current": {"min": 10, "max": 150, "norm_min": 10, "norm_max": 150},
-        }
+
     
     def check_anomaly(self, readings: Dict, well_id: str = None, lift_type: str = None) -> Dict:
         """
@@ -314,10 +178,11 @@ class AnomalyDetector:
         rule_anomaly_score = 0.0
         ml_anomaly_score = 0.0
         
-        # Use lift-type aware rules if available
-        active_rules = self.rules
-        if lift_type and lift_type in WELL_TYPE_RULES:
-            active_rules = WELL_TYPE_RULES[lift_type]
+        # Use lift-type aware rules from dynamic config
+        if lift_type:
+            active_rules = get_well_type_rules(lift_type)
+        else:
+            active_rules = self.rules
         
         # --- RULE-BASED DETECTION ---
         for field, value in readings.items():
@@ -347,14 +212,41 @@ class AnomalyDetector:
                     else:
                         deviation_pct = ((value - rule_max) / range_width) * 100
                 
+                # Get unit from sensor ranges
+                sensor_unit = ""
+                if lift_type:
+                    sensor_ranges = get_sensor_ranges(lift_type)
+                    if field in sensor_ranges:
+                        sensor_unit = sensor_ranges[field].get('unit', "")
+                
+                # Format violation message including units to give the downstream AI explicit context
+                try:
+                    min_str = f"{rule_min:.2f}" if isinstance(rule_min, float) else str(rule_min)
+                except Exception:
+                    min_str = str(rule_min)
+                try:
+                    max_str = f"{rule_max:.2f}" if isinstance(rule_max, float) else str(rule_max)
+                except Exception:
+                    max_str = str(rule_max)
+                try:
+                    val_str = f"{value:.2f}" if isinstance(value, float) else str(value)
+                except Exception:
+                    val_str = str(value)
+
+                unit_str = f" {sensor_unit}" if sensor_unit else ""
+                violation_text = f"Out of range. Expected {min_str}{unit_str} - {max_str}{unit_str}, got {val_str}{unit_str} ({deviation_pct:.1f}% deviation)"
+
+                # Log exact rule values used for debugging mismatched range issues
+                logger.info(f"[AnomalyDetector] lift_type={lift_type} field={field} min={rule_min} max={rule_max} unit={sensor_unit} value={value}")
+
                 violations.append({
                     "field": field,
                     "value": value,
                     "min": rule_min,
                     "max": rule_max,
-                    "unit": UNITS_MAP.get(field, ""),
+                    "unit": sensor_unit,
                     "deviation_pct": round(deviation_pct, 2),
-                    "violation": f"Out of range. Expected {rule_min}-{rule_max}, got {value} ({deviation_pct:.1f}% deviation)"
+                    "violation": violation_text
                 })
                 rule_anomaly_score += 0.25
         
@@ -369,8 +261,17 @@ class AnomalyDetector:
         
         # Combine scores
         combined_score = max(rule_anomaly_score, ml_anomaly_score)
-        is_anomaly = len(violations) > 0 or ml_anomaly_score > 0.5
-        
+
+        # Log scores for debugging and to clarify why an anomaly was flagged
+        logger.info(f"[AnomalyDetector] rule_score={rule_anomaly_score:.3f} ml_score={ml_anomaly_score:.3f} combined_score={combined_score:.3f}")
+
+        # Determine if anomaly. If there are explicit rule violations, flag immediately.
+        # If there are NO rule violations, require a higher ML-only threshold to avoid false positives
+        if len(violations) > 0:
+            is_anomaly = True
+        else:
+            is_anomaly = ml_anomaly_score >= ML_ONLY_ANOMALY_THRESHOLD
+
         return {
             "is_anomaly": is_anomaly,
             "anomaly_score": round(combined_score, 3),
@@ -616,11 +517,11 @@ class AnomalyDetector:
 # Singleton instance
 _detector = None
 
-def get_detector(excel_file: str = EXCEL_FILE) -> AnomalyDetector:
+def get_detector() -> AnomalyDetector:
     """Get or create singleton anomaly detector."""
     global _detector
     if _detector is None:
-        _detector = AnomalyDetector(excel_file)
+        _detector = AnomalyDetector()
     return _detector
 
 def check_anomaly(readings: Dict, well_id: str = None, lift_type: str = None) -> Dict:

@@ -8,6 +8,44 @@ import os
 from uuid import uuid4
 import random
 import openai
+
+# Custom JSON Encoder to handle non-serializable types
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (bool, np.bool_)):
+            return bool(obj)
+        elif isinstance(obj, (np.integer, np.int_, int)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float_, float)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (datetime,)):
+            return obj.isoformat()
+        elif pd.isna(obj):
+            return None
+        else:
+            return super().default(obj)
+
+# Helper function to convert non-JSON-serializable types
+def convert_to_serializable(obj):
+    """Convert non-JSON-serializable objects (like bool, numpy types) to JSON-serializable format."""
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    elif isinstance(obj, bool):
+        return obj  # Python bools are JSON serializable (True/False -> true/false)
+    elif isinstance(obj, (np.bool_, np.integer, np.floating)):
+        return obj.item()  # Convert numpy types to Python native types
+    elif isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
 try:
     from snowflake.connector import connect as snowflake_connect
 except Exception:
@@ -39,6 +77,14 @@ try:
 except ImportError:
     ANOMALY_DETECTOR_AVAILABLE = False
     logging.warning("anomaly_detector module not available; falling back to hardcoded rules")
+
+# Import dynamic configuration
+try:
+    from dynamic_config import get_lift_types, get_form_sensors, get_sensor_ranges, get_form_fields
+    DYNAMIC_CONFIG_AVAILABLE = True
+except ImportError:
+    DYNAMIC_CONFIG_AVAILABLE = False
+    logging.warning("dynamic_config module not available")
 
 load_dotenv()
 
@@ -80,41 +126,12 @@ missing_sf = [k for k in REQUIRED_SNOWFLAKE_KEYS if not SNOWFLAKE_CONFIG.get(k)]
 if missing_sf:
     logging.warning(f"Missing Snowflake configuration keys: {missing_sf}")
 
-# Initialize anomaly detector (loads rules from Excel or uses defaults)
+# Initialize anomaly detector (loads rules from Snowflake dynamic config)
 if ANOMALY_DETECTOR_AVAILABLE:
     anomaly_detector = get_detector()
-    logging.info("✓ Unified anomaly detector initialized")
+    logging.info("✓ Unified anomaly detector initialized with dynamic Snowflake config")
 else:
-    anomaly_detector = None
-    logging.warning("⚠ Anomaly detector unavailable; will use fallback rules")
-
-# Fallback RULES (if detector unavailable)
-RULES = {
-    "surface_pressure": {"min": 100, "max": 400},
-    "tubing_pressure": {"min": 200, "max": 600},
-    "casing_pressure": {"min": 300, "max": 800},
-    "motor_temp": {"min": 100, "max": 250},
-    "wellhead_temp": {"min": 50, "max": 200},
-    "motor_current": {"min": 10, "max": 150},
-}
-
-UNITS_MAP = {
-    "surface_pressure": "psi",
-    "tubing_pressure": "psi",
-    "casing_pressure": "psi",
-    "motor_temp": "°C",
-    "wellhead_temp": "°C",
-    "motor_current": "A",
-    "oil_volume": "bbl",
-    "gas_volume": "mcf",
-    "water_volume": "bbl",
-    "strokes_per_minute": "SPM",
-    "torque": "in-lbs",
-    "vibration": "in/s",
-    "motor_voltage": "V",
-    "drive_frequency": "Hz",
-    "motor_speed": "rpm",
-}
+    raise RuntimeError("Anomaly detector unavailable; dynamic Snowflake config required")
 
 # --- Database Connections ---
 
@@ -190,54 +207,15 @@ def init_postgres():
 
 init_postgres()
 
-# --- Anomaly Detection with Detector Integration ---
+# --- Anomaly Detection with Dynamic Snowflake Config ---
 def check_anomaly(readings, well_id=None, lift_type=None):
     """
-    Check for anomalies using unified detector or fallback rules.
+    Check for anomalies using unified detector with Snowflake dynamic config.
     
-    If detector is available, uses Excel-driven rules + optional ML models.
-    Otherwise falls back to hardcoded RULES.
+    Uses dynamic configuration from Snowflake for all rules and sensor definitions.
     """
-    if anomaly_detector:
-        # Use unified detector with optional well-type awareness
-        return anomaly_detector.check_anomaly(readings, well_id, lift_type)
-    else:
-        # Fallback: use hardcoded RULES
-        violations = []
-        anomaly_score = 0.0
-        
-        for field, value in readings.items():
-            if field not in RULES or value is None:
-                continue
-            
-            rule = RULES[field]
-            if value < rule["min"] or value > rule["max"]:
-                range_width = rule["max"] - rule["min"]
-                if value < rule["min"]:
-                    deviation_pct = ((rule["min"] - value) / range_width) * 100
-                else:
-                    deviation_pct = ((value - rule["max"]) / range_width) * 100
-                
-                violations.append({
-                    "field": field,
-                    "value": value,
-                    "min": rule["min"],
-                    "max": rule["max"],
-                    "unit": UNITS_MAP.get(field, ""),
-                    "deviation_pct": round(deviation_pct, 2),
-                    "violation": f"Out of range. Expected {rule['min']}-{rule['max']}, got {value} ({deviation_pct:.1f}% deviation)"
-                })
-                anomaly_score += 0.25
-        
-        anomaly_score = min(1.0, anomaly_score)
-        
-        return {
-            "is_anomaly": len(violations) > 0,
-            "anomaly_score": anomaly_score,
-            "violations": violations,
-            "summary": f"{len(violations)} rule violation(s) detected" if violations else "No violations detected",
-            "detection_method": "fallback_rules"
-        }
+    # Use unified detector with well-type awareness (required)
+    return anomaly_detector.check_anomaly(readings, well_id, lift_type)
 
 def calculate_severity(anomaly_details, anomaly_score, readings):
     """
@@ -263,18 +241,18 @@ def calculate_severity(anomaly_details, anomaly_score, readings):
     
     avg_deviation = sum(deviations) / len(deviations) if deviations else 0
     
-    # Apply severity matrix
-    if num_violations >= 4 or anomaly_score >= 0.75 or avg_deviation > 50:
+    # Apply severity matrix with increased frequency
+    if num_violations >= 3 or anomaly_score >= 0.7 or avg_deviation > 50:
         return "CRITICAL"
-    elif num_violations == 3 or anomaly_score >= 0.5 or (avg_deviation > 30 and avg_deviation <= 50):
+    elif num_violations == 2 or anomaly_score >= 0.5 or (avg_deviation > 40 and avg_deviation <= 40):
         return "HIGH"
-    elif num_violations == 2 or anomaly_score >= 0.25 or (avg_deviation > 10 and avg_deviation <= 30):
+    elif num_violations == 1 or anomaly_score >= 0.15 or (avg_deviation > 20 and avg_deviation <= 30):
         return "MEDIUM"
     else:
         return "LOW"
 
 # --- AI Logic ---
-def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, historical_anomalies=None):
+def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, historical_anomalies=None, lift_type=None):
     try:
         # --- FIX: Always prepare a list, extracting ALL violations as an array ---
         formatted_history = []
@@ -308,11 +286,20 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
                 })
         
         # Always dump as JSON string
-        history_context_str = json.dumps(formatted_history, indent=2)
+        history_context_str = json.dumps(formatted_history, indent=2, cls=CustomJSONEncoder, default=str)
 
-        # Calculate severity once to pass to prompt
+            # Calculate severity once to pass to prompt
         calculated_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
  
+        # Instruct the model to use the units provided in each violation and not to convert units.
+        # Also include authoritative sensor ranges fetched from dynamic config for the well's lift type
+        sensor_ranges_str = "{}"
+        try:
+            if lift_type and DYNAMIC_CONFIG_AVAILABLE:
+                sensor_ranges = get_sensor_ranges(lift_type)
+                sensor_ranges_str = json.dumps(sensor_ranges, indent=2, cls=CustomJSONEncoder, default=str)
+        except Exception:
+            sensor_ranges_str = "{}"
         prompt = f"""
         You are an expert Production Engineer AI assistant. Analyze the new anomaly.
         
@@ -321,21 +308,26 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
         Well ID: {well_id}
         Timestamp: {timestamp_str}
         Current Sensor Readings:
-        {json.dumps(readings, indent=2)}
+        {json.dumps(readings, indent=2, cls=CustomJSONEncoder, default=str)}
         Violations Detected:
-        {json.dumps(anomaly_details['violations'], indent=2)}
+        {json.dumps(anomaly_details['violations'], indent=2, cls=CustomJSONEncoder, default=str)}
+        
+        Authoritative Sensor Ranges for lift type ({lift_type}):
+        {sensor_ranges_str}
         ---
         Real Database History for this well (for context):
         {history_context_str}
         ---
  
+        IMPORTANT: Use the units provided in each violation entry exactly as given. Do NOT convert units (e.g., do not change °F to °C) or invent ranges. Use the 'unit', 'min', and 'max' fields from the Violations Detected objects when describing values and expected ranges. If a violation list is empty, fall back to the authoritative sensor ranges provided in the 'Authoritative Sensor Ranges' section above.
+
         Based on the information above, provide a structured JSON response.
 
         SEVERITY CLASSIFICATION GUIDE:
-        - CRITICAL: >50% deviation, 4+ violations, or score >= 0.75
-        - HIGH: 30-50% deviation, 3 violations, or score >= 0.5
-        - MEDIUM: 10-30% deviation, 2 violations, or score >= 0.25
-        - LOW: <10% deviation, 1 violation, or score < 0.25
+        - CRITICAL: >50% deviation, 3+ violations, or score >= 0.7
+        - HIGH: 30-50% deviation, 2 violations, or score >= 0.5
+        - MEDIUM: 20-30% deviation, 1 violation, or score >= 0.3
+        - LOW: <10% deviation, 0 violations, or score < 0.20
         
         CONFIDENCE CALCULATION:
         Calculate confidence as a percentage based on the anomaly score:
@@ -359,7 +351,7 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
         4. "confidence": IMPORTANT - Percentage string (e.g., "65%") calculated from anomaly score. MUST be between 10% and 99%. DO NOT always return 100%. Use the confidence calculation guide above.
         5. "description": Write a concise, technical paragraph. Within this paragraph, you MUST clearly describe each parameter from 'Violations Detected' that is out of range.
             For each parameter, state the nature of the anomaly by including its observed value and the expected range, both with their units.
-            For example: "The motor temperature reached 265 °C, exceeding the expected operational range of 100–250 °C."
+            For example: "The motor temperature reached 265 [unit], exceeding the expected operational range of 100–250 [unit]." Use the 'unit' field from each violation object.
         6. "suggested_actions": A list of at least three clear, actionable steps.
         7. "explanation": Detailed explanation of the new anomaly.
         8. "historical_context": Object containing:
@@ -417,6 +409,30 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
 def index():
     return render_template('index.html')
 
+@app.route('/api/form-config', methods=['GET'])
+def get_form_config():
+    """Get dynamic form configuration for all lift types."""
+    try:
+        if not DYNAMIC_CONFIG_AVAILABLE:
+            return jsonify({"error": "Dynamic config not available"}), 503
+        
+        lift_types = get_lift_types()
+        config = {}
+        
+        for lift_type_name in lift_types.keys():
+            sensors = get_form_sensors(lift_type_name)
+            ranges = get_sensor_ranges(lift_type_name)
+            
+            config[lift_type_name] = {
+                'sensors': sensors,
+                'ranges': ranges
+            }
+        
+        return jsonify(config), 200
+    except Exception as e:
+        logging.error(f"Error fetching form config: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/insert-reading', methods=['POST'])
 def insert_reading():
     try:
@@ -447,6 +463,15 @@ def insert_reading():
 
         # Use unified detector with optional lift_type awareness
         anomaly_details = check_anomaly(readings, well_id=well_id, lift_type=lift_type)
+
+        # Safety post-check: if there are no rule violations and the anomaly_score
+        # is below the ML-only threshold, treat as non-anomalous to avoid false positives.
+        try:
+            from anomaly_detector import ML_ONLY_ANOMALY_THRESHOLD
+            if (not anomaly_details.get('violations')) and float(anomaly_details.get('anomaly_score', 0)) < ML_ONLY_ANOMALY_THRESHOLD:
+                anomaly_details['is_anomaly'] = False
+        except Exception:
+            pass
 
         # 1. Insert Raw Reading into Snowflake
         conn = get_db_connection()
@@ -491,12 +516,14 @@ def insert_reading():
         finally:
             cursor.close()
         
+        # 1B. Insert into lift-type specific table
+        
         suggestion_result = None
 
         if anomaly_details['is_anomaly']:
             # 2. Insert Anomaly Record into Snowflake (Legacy/Backup)
             violation_summary = "; ".join([v['violation'] for v in anomaly_details['violations']])
-            raw_values = json.dumps(readings)
+            raw_values = json.dumps(readings, cls=CustomJSONEncoder, default=str)
             cursor = conn.cursor()
             try:
                 anomaly_params = (
@@ -597,12 +624,57 @@ def insert_reading():
             
             ### END: SIMILARITY SEARCH INTEGRATION ###
 
+            # If rule-based violations are empty but anomaly score is high,
+            # augment anomaly_details with synthetic violations using dynamic sensor ranges
+            augmented_anomaly_details = anomaly_details.copy()
+            try:
+                if (not augmented_anomaly_details.get('violations')) and lift_type and DYNAMIC_CONFIG_AVAILABLE:
+                    sensor_ranges = get_sensor_ranges(lift_type)
+                    synth_violations = []
+                    for field, val in readings.items():
+                        if val is None:
+                            continue
+                        if field in sensor_ranges:
+                            sr = sensor_ranges[field]
+                            mn = sr.get('min')
+                            mx = sr.get('max')
+                            unit = sr.get('unit') or ""
+                            if mn is not None and mx is not None and (val < mn or val > mx):
+                                # compute deviation pct like detector
+                                rng = mx - mn if (mx - mn) != 0 else 1
+                                if val < mn:
+                                    deviation = ((mn - val) / rng) * 100
+                                else:
+                                    deviation = ((val - mx) / rng) * 100
+                                violation_text = f"Out of range. Expected {mn}-{mx} {unit}, got {val} {unit} ({deviation:.1f}% deviation)"
+                                synth_violations.append({
+                                    'field': field,
+                                    'value': val,
+                                    'min': mn,
+                                    'max': mx,
+                                    'unit': unit,
+                                    'deviation_pct': round(deviation, 2),
+                                    'violation': violation_text
+                                })
+
+                    if synth_violations:
+                        augmented_anomaly_details['violations'] = synth_violations
+                        augmented_anomaly_details['summary'] = f"{len(synth_violations)} synthetic violation(s) augmented from dynamic config"
+            except Exception:
+                # If augmentation fails, fall back to original anomaly_details
+                augmented_anomaly_details = anomaly_details
+
+            # If we augmented violations, make augmented_anomaly_details the canonical anomaly_details
+            if augmented_anomaly_details is not anomaly_details:
+                anomaly_details = augmented_anomaly_details
+
             suggestion_result = generate_suggestion(
-                anomaly_details, 
-                well_id, 
-                readings, 
+                anomaly_details,
+                well_id,
+                readings,
                 timestamp_str,
-                historical_anomalies=recent_anomalies_for_prompt
+                historical_anomalies=recent_anomalies_for_prompt,
+                lift_type=lift_type
             )
 
             asset_id = f"ALT-{random.randint(100000, 999999)}"
@@ -631,11 +703,11 @@ def insert_reading():
                             suggestion_result.get('status'),
                             suggestion_result.get('confidence'),
                             suggestion_result.get('description'),
-                            json.dumps(suggestion_result.get('suggested_actions')),
+                            json.dumps(suggestion_result.get('suggested_actions'), cls=CustomJSONEncoder, default=str),
                             suggestion_result.get('explanation'),
-                            json.dumps(suggestion_result.get('historical_context', {})),
-                            json.dumps(suggestion_result.get('risk_analysis', {})),
-                            json.dumps(anomaly_details)
+                            json.dumps(suggestion_result.get('historical_context', {}), cls=CustomJSONEncoder, default=str),
+                            json.dumps(suggestion_result.get('risk_analysis', {}), cls=CustomJSONEncoder, default=str),
+                            json.dumps(anomaly_details, cls=CustomJSONEncoder, default=str)
                         )
                         
                         cur.execute(insert_query, insert_values)
@@ -685,6 +757,8 @@ def get_well_history(well_id):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Get readings from main table (now contains all fields)
         try:
             cursor.execute(
                 """
@@ -701,9 +775,13 @@ def get_well_history(well_id):
                 readings_df = pd.DataFrame(rows, columns=cols)
             else:
                 readings_df = pd.DataFrame()
+        except Exception as e:
+            logging.error(f"Error fetching readings: {e}")
+            readings_df = pd.DataFrame()
         finally:
             cursor.close()
 
+        # Get anomaly suggestions from PostgreSQL
         suggestions_list = []
         pg_conn = get_pg_connection()
         if pg_conn:
@@ -725,6 +803,7 @@ def get_well_history(well_id):
                 if pg_conn:
                     pg_conn.close()
 
+        # Fallback to legacy anomalies if no suggestions
         if not suggestions_list:
             cursor = conn.cursor()
             try:
@@ -743,6 +822,9 @@ def get_well_history(well_id):
                     anomalies_df = pd.DataFrame(rows, columns=cols)
                 else:
                     anomalies_df = pd.DataFrame()
+            except Exception as e:
+                logging.error(f"Error fetching legacy anomalies: {e}")
+                anomalies_df = pd.DataFrame()
             finally:
                 cursor.close()
 
@@ -763,6 +845,8 @@ def get_well_history(well_id):
                 })
 
         conn.close()
+        
+        # Convert readings to list, handling NaN/inf values
         readings_list = []
         for _, row in readings_df.iterrows():
             record = row.to_dict()
@@ -797,10 +881,7 @@ def get_wells():
             if rows and cursor.description:
                 cols = [c[0].lower() for c in cursor.description]
                 wells_df = pd.DataFrame(rows, columns=cols)
-                if 'well_id' in wells_df.columns:
-                    wells = wells_df['well_id'].tolist()
-                else:
-                    wells = [r[0] for r in rows]
+                wells = wells_df['well_id'].tolist() if 'well_id' in wells_df.columns else [r[0] for r in rows]
             else:
                 wells = []
         finally:
