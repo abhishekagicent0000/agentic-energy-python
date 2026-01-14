@@ -141,14 +141,25 @@ class RuleEngine:
             field = str(row.get('field') or row.get('Field') or '')
             if not field:
                 continue
-            try:
-                minv = float(row.get('min')) if not pd.isna(row.get('min')) else None
-            except Exception:
-                minv = None
-            try:
-                maxv = float(row.get('max')) if not pd.isna(row.get('max')) else None
-            except Exception:
-                maxv = None
+            # support alternate column names that users might have
+            min_candidates = ['min', 'min_value', 'minimum', 'lower']
+            max_candidates = ['max', 'max_value', 'maximum', 'upper']
+            minv = None
+            maxv = None
+            for c in min_candidates:
+                if c in row and not pd.isna(row.get(c)):
+                    try:
+                        minv = float(row.get(c))
+                        break
+                    except Exception:
+                        minv = None
+            for c in max_candidates:
+                if c in row and not pd.isna(row.get(c)):
+                    try:
+                        maxv = float(row.get(c))
+                        break
+                    except Exception:
+                        maxv = None
             rules[field] = {'min': minv, 'max': maxv}
         self.rules = rules
         return rules
@@ -191,6 +202,7 @@ class RuleEngine:
                 recs.append({
                     'well_id': well_id,
                     'action': 'Increase ESP frequency',
+                    'category': 'Production',
                     'priority': 'HIGH',
                     'status': 'New',
                     'reason': f'motor_current {mc:.1f} > threshold {mc_thresh:.1f} and motor_temp rising',
@@ -219,7 +231,8 @@ class RuleEngine:
             if sp_slope < slope_thresh and oil_slope < (oil_stats['slope'] - adaptive_k * (oil_stats['slope_std'] or 0.0)):
                 recs.append({
                     'well_id': well_id,
-                    'action': 'Adjust pump/polish choke',
+                            'action': 'Adjust pump/polish choke',
+                            'category': 'Production',
                     'priority': 'HIGH',
                     'status': 'New',
                     'reason': 'surface_pressure and oil production both declining relative to baseline',
@@ -242,6 +255,7 @@ class RuleEngine:
             recs.append({
                 'well_id': well_id,
                 'action': 'Optimize gas lift injection rate',
+                'category': 'Optimization',
                 'priority': 'MEDIUM',
                 'status': 'New',
                 'reason': 'gas volume below threshold',
@@ -278,6 +292,7 @@ def _create_table_sql(table_name: str = 'operation_recommendation'):
     CREATE TABLE IF NOT EXISTS {table_name} (
         id VARCHAR PRIMARY KEY,
         well_id VARCHAR NOT NULL,
+        category VARCHAR,
         action VARCHAR NOT NULL,
         priority VARCHAR,
         status VARCHAR,
@@ -312,6 +327,30 @@ def save_recommendation_to_snowflake(conn, rec: dict, table_name: str = 'operati
         rec_id = rec.get('id') or str(uuid.uuid4())
         details = json.dumps(rec).replace("'", "''")  # escape single quotes
         metrics = metrics or rec.get('metrics', {})
+        # ensure category present (may be added by rule engine or ML model)
+        if not rec.get('category'):
+            try:
+                from sklearn.externals import joblib as _jb
+            except Exception:
+                _jb = joblib
+            try:
+                model_path = os.path.join('models', 'category_classifier.joblib')
+                if os.path.exists(model_path) and joblib is not None:
+                    mdl = joblib.load(model_path)
+                    features = mdl.get('features') if isinstance(mdl, dict) else None
+                    clf = mdl.get('model') if isinstance(mdl, dict) else mdl
+                    if features and clf is not None:
+                        fv = []
+                        for f in features:
+                            fv.append(metrics.get(f) if metrics and f in metrics else 0.0)
+                        try:
+                            probas = clf.predict_proba([fv])[0]
+                            pred = clf.classes_[probas.argmax()]
+                            rec['category'] = pred
+                        except Exception:
+                            rec['category'] = 'Production'
+            except Exception:
+                rec['category'] = rec.get('category', 'Production')
         
         def sql_value(v):
             """Convert Python value to SQL literal"""
@@ -328,11 +367,13 @@ def save_recommendation_to_snowflake(conn, rec: dict, table_name: str = 'operati
         
         insert_sql = f"""INSERT INTO {table_name}
         (id, well_id, action, priority, status, reason, expected_impact, confidence, prediction_source, probability,
+         category,
          oil_volume_slope, oil_volume_roll_mean, gas_volume_slope, gas_volume_roll_mean,
          motor_current_roll_mean, motor_temp_roll_mean, surface_pressure_roll_mean, details, created_at) 
         VALUES (
             {sql_value(rec_id)},
             {sql_value(rec.get('well_id'))},
+            {sql_value(rec.get('category') or 'Production')},
             {sql_value(rec.get('action'))},
             {sql_value(rec.get('priority'))},
             {sql_value(rec.get('status'))},
@@ -362,6 +403,132 @@ def save_recommendation_to_snowflake(conn, rec: dict, table_name: str = 'operati
         raise
     finally:
         cur.close()
+
+
+def predict_category(metrics: dict, model_path: str = 'models/category_classifier.joblib') -> dict:
+    """Predict recommendation category from a metrics dict using a trained model.
+
+    Returns {'category': str, 'probability': float} or {} if unavailable.
+    """
+    if joblib is None:
+        return {}
+    try:
+        if not os.path.exists(model_path):
+            return {}
+        mdl = joblib.load(model_path)
+        if isinstance(mdl, dict):
+            clf = mdl.get('model')
+            features = mdl.get('features', [])
+            le = mdl.get('le')
+        else:
+            clf = mdl
+            features = ['oil_volume_roll_mean', 'gas_volume_roll_mean', 'motor_current_roll_mean',
+                        'motor_temp_roll_mean', 'surface_pressure_roll_mean', 'oil_volume_slope',
+                        'gas_volume_slope', 'motor_temp_slope', 'missing_rate', 'motor_current_motor_temp_corr']
+            le = None
+
+        fv = []
+        for f in features:
+            fv.append(metrics.get(f) if metrics and f in metrics else 0.0)
+
+        probs = clf.predict_proba([fv])[0]
+        idx = probs.argmax()
+        pred = clf.classes_[idx]
+        # if label encoder present
+        if le is not None:
+            try:
+                pred = le.inverse_transform([pred])[0]
+            except Exception:
+                pass
+        return {'category': pred, 'probability': float(probs[idx])}
+    except Exception:
+        return {}
+
+
+def train_category_model(snowflake_conn, model_path: str = 'models/category_classifier.joblib') -> dict:
+    """Train a category classifier using synthetic labels generated by the rule engine.
+
+    - Fetch recent sensor readings per well
+    - Compute metrics via TrendAnalyzer
+    - Use RuleEngine.apply to create synthetic recommendation labels and their categories
+    - Train a RandomForestClassifier and save via joblib
+    Returns training summary dict.
+    """
+    if RandomForestClassifier is None or joblib is None:
+        raise RuntimeError('Required sklearn or joblib not available')
+
+    cur = snowflake_conn.cursor()
+    X = []
+    y = []
+    wells = []
+    try:
+        cur.execute("SELECT DISTINCT well_id FROM well_sensor_readings")
+        wells = [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"Error fetching wells for training: {e}")
+        raise
+
+    re = RuleEngine()
+
+    for well in wells:
+        try:
+            cur.execute("SELECT timestamp, oil_volume, gas_volume, motor_current, motor_temp, surface_pressure FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 168", (well,))
+            rows = cur.fetchall()
+            if not rows:
+                continue
+            cols = [d[0] for d in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+            # coerce numeric columns
+            for c in ['oil_volume', 'gas_volume', 'motor_current', 'motor_temp', 'surface_pressure']:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
+
+            ta = TrendAnalyzer(df.set_index('timestamp')) if 'timestamp' in df.columns else TrendAnalyzer(df)
+            metrics = ta.compute_metrics()
+            recs = re.apply(well, metrics, trend_analyzer=ta)
+            for rec in recs:
+                cat = rec.get('category')
+                if not cat:
+                    continue
+                feat = [
+                    metrics.get('oil_volume_roll_mean'),
+                    metrics.get('gas_volume_roll_mean'),
+                    metrics.get('motor_current_roll_mean'),
+                    metrics.get('motor_temp_roll_mean'),
+                    metrics.get('surface_pressure_roll_mean'),
+                    metrics.get('oil_volume_slope'),
+                    metrics.get('gas_volume_slope'),
+                    metrics.get('motor_temp_slope'),
+                    metrics.get('missing_rate'),
+                    metrics.get('motor_current_motor_temp_corr')
+                ]
+                X.append([0.0 if v is None else v for v in feat])
+                y.append(cat)
+        except Exception as e:
+            logger.warning(f"Error processing well {well} for category training: {e}")
+            continue
+
+    if not X:
+        raise RuntimeError('No training samples generated')
+
+    # encode labels
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y)
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(X, y_enc)
+
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    joblib.dump({'model': clf, 'features': ['oil_volume_roll_mean', 'gas_volume_roll_mean', 'motor_current_roll_mean', 'motor_temp_roll_mean', 'surface_pressure_roll_mean', 'oil_volume_slope', 'gas_volume_slope', 'motor_temp_slope', 'missing_rate', 'motor_current_motor_temp_corr'], 'le': le, 'classes_': le.classes_.tolist()}, model_path)
+
+    # basic report
+    preds = clf.predict(X)
+    from sklearn.metrics import classification_report
+    report = classification_report(y_enc, preds, target_names=le.classes_.tolist(), zero_division=0)
+    summary = {'n_samples': len(X), 'classes': le.classes_.tolist(), 'report': report, 'model_path': model_path}
+    logger.info(f"Trained category classifier: {summary}")
+    return summary
 
 
 def train_with_synthetic_labels(snowflake_conn, model_path: str = 'models/decision_tree_synthetic.joblib'):

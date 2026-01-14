@@ -249,7 +249,20 @@ class AnomalyDetector:
                     "deviation_pct": round(deviation_pct, 2),
                     "violation": violation_text
                 })
-                rule_anomaly_score += 0.25
+                # Deviation-weighted contribution: base + extra proportional to deviation
+                try:
+                    dev_factor = float(deviation_pct) / 100.0
+                except Exception:
+                    dev_factor = 0.0
+
+                # Increased-sensitivity contribution for a rule violation:
+                # - larger base contribution so single violations matter more
+                # - stronger scaling of deviation (dev_factor) and higher cap for extra
+                base_contrib = 0.35
+                extra = min(0.7, dev_factor * 0.9)
+                contrib = base_contrib + extra
+
+                rule_anomaly_score += contrib
         
         rule_anomaly_score = min(1.0, rule_anomaly_score)
         
@@ -260,8 +273,14 @@ class AnomalyDetector:
             if ml_anomaly_score > 0.5:
                 detection_method = "statistical_rules + trained_ml_model"
         
-        # Combine scores
-        combined_score = max(rule_anomaly_score, ml_anomaly_score)
+        # Combine scores using configured weights (favor rule signal by default)
+        try:
+            rules_w = float(WEIGHTS.get('rules', 0.4))
+        except Exception:
+            rules_w = 0.4
+        ml_w = max(0.0, 1.0 - rules_w)
+
+        combined_score = min(1.0, rules_w * rule_anomaly_score + ml_w * ml_anomaly_score)
 
         # Log scores for debugging and to clarify why an anomaly was flagged
         logger.info(f"[AnomalyDetector] rule_score={rule_anomaly_score:.3f} ml_score={ml_anomaly_score:.3f} combined_score={combined_score:.3f}")
