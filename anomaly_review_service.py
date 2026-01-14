@@ -629,7 +629,7 @@ def fetch_existing_anomalies(well_id: str, days: int) -> Dict[tuple, str]:
                 try:
                     cur.execute("""
                         SELECT anomaly_code, to_char(event_date, 'YYYY-MM-DD'), status 
-                        FROM operation_suggestion 
+                        FROM anomaly_review 
                         WHERE well_id = %s AND event_date >= CURRENT_DATE - INTERVAL '%s days'
                     """, (well_id, days))
                     rows = cur.fetchall()
@@ -712,7 +712,7 @@ def save_reviews(reviews: List[Dict]):
                     # 'ON CONFLICT DO NOTHING' keeps original status if exists.
                     
                     insert_query = """
-                        INSERT INTO operation_suggestion
+                        INSERT INTO anomaly_review
                         (well_id, event_date, detected_at, anomaly_code, category, severity, 
                          title, ui_text, impact_value, impact_unit, chart_data, status)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -730,7 +730,7 @@ def save_reviews(reviews: List[Dict]):
                             r['status']
                         ))
                 conn.commit()
-                logger.info(f"Saved {len(reviews)} anomalies to Postgres operation_suggestion.")
+                logger.info(f"Saved {len(reviews)} anomalies to Postgres anomaly_review.")
     except Exception as e:
         logger.error(f"Postgres save failed: {e}")
 
@@ -743,9 +743,9 @@ def save_reviews(reviews: List[Dict]):
             # Snowflake doesn't allow ON CONFLICT cleanly, so we check first or MERGE is better.
             # Using basic check-then-insert loop for safety
             
-            check_q = "SELECT count(*) FROM operation_suggestion WHERE well_id=%s AND anomaly_code=%s AND event_date=%s"
+            check_q = "SELECT count(*) FROM anomaly_review WHERE well_id=%s AND anomaly_code=%s AND event_date=%s"
             insert_q = """
-                INSERT INTO operation_suggestion
+                INSERT INTO anomaly_review
                 (well_id, event_date, detected_at, anomaly_code, category, severity, 
                  title, ui_text, impact_value, impact_unit, chart_data, status)
                 SELECT %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s, PARSE_JSON(%s), %s
@@ -766,7 +766,7 @@ def save_reviews(reviews: List[Dict]):
                     ))
                     count += 1
             conn.commit()
-            logger.info(f"Saved {count} anomalies to Snowflake operation_suggestion.")
+            logger.info(f"Saved {count} anomalies to Snowflake anomaly_review.")
     except Exception as e:
         logger.error(f"Snowflake save failed: {e}")
 

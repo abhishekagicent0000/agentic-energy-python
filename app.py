@@ -230,12 +230,20 @@ def find_similar_anomalies(current_readings, current_violations, historical_df, 
             if not common_keys:
                  continue 
 
-            # Calculate match score
+            # STRICT MATCHING: Historical record must have ALL violated parameters
+            # First, check if this historical record has data for ALL currently violated keys
+            missing_keys = [key for key in violated_keys if key not in hist_values or hist_values[key] is None]
+            
+            if missing_keys:
+                # Skip this historical record - it doesn't have all the violated parameters
+                continue
+            
+            # Calculate match score for ALL violated parameters
             matches = 0
             total_score = 0
             
             for key in violated_keys:
-                if key in hist_values and hist_values[key] is not None and current_readings.get(key) is not None:
+                if current_readings.get(key) is not None:
                     curr_val = float(current_readings[key])
                     # Handle historical value which might be a string in JSON
                     hist_val = float(hist_values[key])
@@ -251,7 +259,8 @@ def find_similar_anomalies(current_readings, current_violations, historical_df, 
                         matches += 1
                         total_score += similarity
             
-            if matches > 0:
+            # Only accept if ALL violated parameters matched the similarity threshold
+            if matches == len(violated_keys):
                 # Average similarity across matched items
                 avg_similarity = total_score / matches
                 
