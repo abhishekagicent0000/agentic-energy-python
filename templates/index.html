@@ -249,6 +249,19 @@
         margin: 0 auto 8px;
       }
 
+      /* small spinner for inline buttons */
+      .btn-spinner {
+        display: inline-block;
+        vertical-align: middle;
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(0, 240, 255, 0.12);
+        border-top: 2px solid var(--primary-cyan);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        margin-right: 8px;
+      }
+
       @keyframes spin {
         0% {
           transform: rotate(0deg);
@@ -299,20 +312,23 @@
         margin-top: 10px;
       }
 
-      /* Compact Logs */
+      /* Compact Logs — scrollable JSON panels */
       pre,
       #anomaliesJson,
       #readingsJson,
       #recommendationsJson {
-        background: #000 !important;
+        background: #000;
         border: 1px solid #333;
-        color: var(--success) !important;
-        font-family: "Fira Code", monospace !important;
+        color: var(--success);
+        font-family: "Fira Code", monospace;
         padding: 10px;
         border-radius: 4px;
         font-size: 0.75rem;
         line-height: 1.3;
-        /* Scrollbar styling */
+        white-space: pre; /* preserve JSON newlines/indent */
+        max-height: 260px; /* make panels scrollable */
+        overflow-y: auto;
+        overflow-x: hidden;
         scrollbar-width: thin;
         scrollbar-color: var(--primary-blue) #000;
       }
@@ -383,7 +399,7 @@
             <strong>ℹ️ PROTOCOL</strong> Neural network analysis initiation.
           </div>
 
-          <form id="sensorForm">
+          <form id="sensorForm" novalidate>
             <div class="form-row">
               <div class="form-group">
                 <label for="wellId">Well ID *</label>
@@ -392,12 +408,11 @@
                   id="wellId"
                   name="wellId"
                   placeholder="e.g., Well_001"
-                  required
                 />
               </div>
               <div class="form-group">
                 <label for="liftType">Well Type *</label>
-                <select id="liftType" name="liftType" required>
+                <select id="liftType" name="liftType">
                   <option value="">-- Select Type --</option>
                   <option value="Rod Pump">Rod Pump</option>
                   <option value="ESP">ESP</option>
@@ -414,20 +429,18 @@
                 <div class="form-group">
                   <label id="strokeLabel">Strokes/Min (0.5-12.0)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="strokesPerMinute"
                     name="strokesPerMinute"
-                    step="0.1"
                     placeholder="6"
                   />
                 </div>
                 <div class="form-group">
                   <label id="torqueLabel">Torque in-lbs (100k-1.8M)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="torque"
                     name="torque"
-                    step="1000"
                     placeholder="900000"
                   />
                 </div>
@@ -437,20 +450,18 @@
                 <div class="form-group">
                   <label id="loadLabel">Polish Rod Load lbs (0-125k)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="polishRodLoad"
                     name="polishRodLoad"
-                    step="100"
                     placeholder="50000"
                   />
                 </div>
                 <div class="form-group">
                   <label id="fillageLabel">Pump Fillage % (0-100)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="pumpFillage"
                     name="pumpFillage"
-                    step="1"
                     placeholder="80"
                   />
                 </div>
@@ -462,10 +473,9 @@
                     >Tubing Pressure psi (0-5000)</label
                   >
                   <input
-                    type="number"
+                    type="text"
                     id="tubingPressureRod"
                     name="tubingPressureRod"
-                    step="1"
                     placeholder="2500"
                   />
                 </div>
@@ -478,20 +488,18 @@
                 <div class="form-group">
                   <label id="motorTempLabel">Motor °F (50-1500)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="motorTempEsp"
                     name="motorTempEsp"
-                    step="1"
                     placeholder="500"
                   />
                 </div>
                 <div class="form-group">
                   <label id="motorCurrentLabel">Motor Current A (0-200)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="motorCurrentEsp"
                     name="motorCurrentEsp"
-                    step="1"
                     placeholder="100"
                   />
                 </div>
@@ -503,10 +511,9 @@
                     >Discharge Pressure psi (0-5000)</label
                   >
                   <input
-                    type="number"
+                    type="text"
                     id="dischargePressure"
                     name="dischargePressure"
-                    step="1"
                     placeholder="2500"
                   />
                 </div>
@@ -515,10 +522,9 @@
                     >Pump Intake Pressure psi (0-5000)</label
                   >
                   <input
-                    type="number"
+                    type="text"
                     id="pumpIntakePressure"
                     name="pumpIntakePressure"
-                    step="1"
                     placeholder="1200"
                   />
                 </div>
@@ -528,10 +534,9 @@
                 <div class="form-group">
                   <label id="motorVoltageLabel">Motor Voltage V (0-5000)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="motorVoltage"
                     name="motorVoltage"
-                    step="1"
                     placeholder="3000"
                   />
                 </div>
@@ -546,10 +551,9 @@
                     >Injection Rate scf/d (0-2000)</label
                   >
                   <input
-                    type="number"
+                    type="text"
                     id="injectionRate"
                     name="injectionRate"
-                    step="1"
                     placeholder="1000"
                   />
                 </div>
@@ -558,10 +562,9 @@
                     >Injection Temperature °F (0-1000)</label
                   >
                   <input
-                    type="number"
+                    type="text"
                     id="injectionTemperature"
                     name="injectionTemperature"
-                    step="1"
                     placeholder="500"
                   />
                 </div>
@@ -573,10 +576,9 @@
                     >Bottomhole Pressure psi (50-5000)</label
                   >
                   <input
-                    type="number"
+                    type="text"
                     id="bottomholePressure"
                     name="bottomholePressure"
-                    step="1"
                     placeholder="2500"
                   />
                 </div>
@@ -585,10 +587,9 @@
                     >Injection Pressure psi (100-5000)</label
                   >
                   <input
-                    type="number"
+                    type="text"
                     id="injectionPressure"
                     name="injectionPressure"
-                    step="1"
                     placeholder="2000"
                   />
                 </div>
@@ -598,10 +599,9 @@
                 <div class="form-group">
                   <label id="cycleTimeLabel">Cycle Time minutes (5-180)</label>
                   <input
-                    type="number"
+                    type="text"
                     id="cycleTime"
                     name="cycleTime"
-                    step="1"
                     placeholder="60"
                   />
                 </div>
@@ -924,7 +924,7 @@
           }
         });
 
-      // Load history
+      // Load history with inline button loader and reveal Recommendations
       document
         .getElementById("loadHistory")
         .addEventListener("click", async () => {
@@ -933,6 +933,12 @@
             alert("Select Target Well");
             return;
           }
+
+          const loadBtn = document.getElementById("loadHistory");
+          const recBtn = document.getElementById("checkRecommendations");
+          const originalText = loadBtn.innerHTML;
+          loadBtn.disabled = true;
+          loadBtn.innerHTML = '<span class="btn-spinner"></span> Loading...';
 
           try {
             const response = await fetch(`/api/well-history/${wellId}`);
@@ -952,7 +958,22 @@
                 : "[] // NULL";
 
             document.getElementById("historySection").style.display = "block";
+
+            // Restore History button to default label and enabled state
+            loadBtn.disabled = false;
+            loadBtn.innerHTML = "History";
+
+            // Move the AI Recommendations button to the bottom of the card (after history)
+            try {
+              const historySection = document.getElementById("historySection");
+              historySection.insertAdjacentElement("afterend", recBtn);
+              recBtn.style.marginTop = "10px";
+            } catch (e) {
+              // ignore if DOM move fails
+            }
           } catch (error) {
+            loadBtn.disabled = false;
+            loadBtn.innerHTML = originalText;
             alert("DB Err: " + error.message);
           }
         });

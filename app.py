@@ -359,35 +359,68 @@ def calculate_severity(anomaly_details, anomaly_score, readings):
     """
     Calculate severity based on violation count, anomaly score, and deviation percentage.
     """
-    violations = anomaly_details.get('violations', [])
+    violations = anomaly_details.get('violations', []) or []
     num_violations = len(violations)
-    
-    # Calculate average deviation percentage
+
+    # Calculate average deviation percentage robustly
     deviations = []
     for v in violations:
-        field = v.get('field')
-        value = v.get('value')
-        min_val = v.get('min')
-        max_val = v.get('max')
-        
-        if value is not None and min_val is not None and max_val is not None:
-            if value < min_val:
-                deviation = abs(value - min_val) / abs(max_val - min_val) * 100
+        try:
+            value = v.get('value')
+            min_val = v.get('min')
+            max_val = v.get('max')
+
+            if value is None or min_val is None or max_val is None:
+                continue
+
+            # Safely coerce to float
+            fv = float(value)
+            fmin = float(min_val)
+            fmax = float(max_val)
+
+            rng = abs(fmax - fmin) if (fmax - fmin) != 0 else 1.0
+            if fv < fmin:
+                deviation = abs(fmin - fv) / rng * 100.0
             else:
-                deviation = abs(value - max_val) / abs(max_val - min_val) * 100
+                deviation = abs(fv - fmax) / rng * 100.0
+
             deviations.append(deviation)
-    
-    avg_deviation = sum(deviations) / len(deviations) if deviations else 0
-    
-    # Apply severity matrix with increased frequency
-    if num_violations >= 3 or anomaly_score >= 0.7 or avg_deviation > 50:
+        except Exception:
+            continue
+
+    avg_deviation = float(sum(deviations) / len(deviations)) if deviations else 0.0
+    a_score = float(anomaly_score or 0.0)
+
+    # Tighter, less-trigger-happy severity matrix
+    # CRITICAL only when multiple violations AND strong signal, or extremely high ML score
+    if (num_violations >= 3 and (a_score >= 0.85 or avg_deviation > 60)) or a_score >= 0.98:
         return "CRITICAL"
-    elif num_violations == 2 or anomaly_score >= 0.5 or (avg_deviation > 40 and avg_deviation <= 40):
-        return "HIGH"
-    elif num_violations == 1 or anomaly_score >= 0.15 or (avg_deviation > 20 and avg_deviation <= 30):
-        return "MEDIUM"
-    else:
+
+    # Two violations: usually HIGH if deviation or score moderate-high
+    if num_violations == 2:
+        if a_score >= 0.60 or avg_deviation > 40:
+            return "HIGH"
+        if a_score >= 0.35 or avg_deviation > 20:
+            return "MEDIUM"
         return "LOW"
+
+    # Single violation: be conservative
+    if num_violations == 1:
+        # Strong signal or large deviation -> HIGH
+        if a_score >= 0.50 or avg_deviation > 25:
+            return "HIGH"
+        # Moderate deviation or modest ML signal -> MEDIUM
+        if a_score >= 0.35 or avg_deviation > 12:
+            return "MEDIUM"
+        # Small deviation -> LOW
+        return "LOW"
+
+    # No rule violations: rely on ML score bands
+    if a_score >= 0.75:
+        return "HIGH"
+    if a_score >= 0.35:
+        return "MEDIUM"
+    return "LOW"
 
 # --- AI Logic ---
 def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, historical_anomalies=None, lift_type=None):
@@ -427,8 +460,8 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
         # Always dump as JSON string
         history_context_str = json.dumps(formatted_history, indent=2, cls=CustomJSONEncoder, default=str)
     
-        # calculated_severity is already computed in insert_reading or needs to be computed here if this function called standalone
-        # We can re-calculate just to be safe as it's cheap
+        # calculated_severity is computed in insert_reading; if this function called standalone
+        # we recompute here just to be safe (cheap).
         calculated_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
  
         # Instruct the model to use the units provided in each violation and not to convert units.
@@ -463,20 +496,19 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
 
         Based on the information above, provide a structured JSON response.
 
-        SEVERITY CLASSIFICATION GUIDE:
-        - CRITICAL: >50% deviation, 3+ violations, or score >= 0.7
-        - HIGH: 30-50% deviation, 2 violations, or score >= 0.5
-        - MEDIUM: 20-30% deviation, 1 violation, or score >= 0.3
-        - LOW: <10% deviation, 0 violations, or score < 0.20
+        SEVERITY CLASSIFICATION GUIDE (Authoritative - follow code logic):
+        - CRITICAL: 3+ violations with strong signal (>=0.85) or avg deviation >60%, or anomaly_score >= 0.98
+        - HIGH: 2 violations with moderate signal (>=0.60) or avg deviation >40%, or anomaly_score >= 0.75
+        - MEDIUM: 1 violation with modest signal (>=0.35) or avg deviation >12%
+        - LOW: otherwise (small deviations or weak ML signal)
         
         CONFIDENCE CALCULATION:
-        Calculate confidence as a SINGLE percentage value based on the anomaly score.
-        Do NOT return a range. Pick a specific number within the bucket.
-        - If anomaly_score >= 0.8: Return a value between 90% and 99% 
-        - If anomaly_score >= 0.6: Return a value between 70% and 85% 
-        - If anomaly_score >= 0.4: Return a value between 50% and 70% 
-        - If anomaly_score >= 0.2: Return a value between 30% and 50% 
-        - If anomaly_score < 0.2: Return a value between 10% and 30% 
+        Calculate confidence as a SINGLE percentage value directly derived from the anomaly score.
+        DO NOT use bucketed ranges. Use this exact rule:
+        - Compute `confidence_percent = round(anomaly_score * 100)`.
+        - Clamp `confidence_percent` into the inclusive range 1 to 99.
+        - Return `confidence` as a string with a percent sign, e.g. "78%".
+        The returned confidence MUST match this calculation and be a single number string.
         
         PRE-CLASSIFIED SEVERITY: {calculated_severity}
         ANOMALY SCORE: {anomaly_details.get('anomaly_score', 0):.2f}
@@ -667,6 +699,21 @@ def insert_reading():
 
         if anomaly_details['is_anomaly']:
             # 2. Insert Anomaly Record into Snowflake (Legacy/Backup)
+            # Recompute severity now that anomaly_details may have been augmented earlier
+            try:
+                final_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
+            except Exception:
+                final_severity = calculated_severity
+
+            # Compute avg_deviation for logging
+            try:
+                devs = [v.get('deviation_pct', 0.0) for v in anomaly_details.get('violations', []) if v.get('deviation_pct') is not None]
+                avg_dev = float(sum(devs) / len(devs)) if devs else 0.0
+            except Exception:
+                avg_dev = 0.0
+
+            logging.info(f"[AnomalyInsert] well={well_id} anomalies={len(anomaly_details.get('violations', []))} anomaly_score={anomaly_details.get('anomaly_score')} avg_deviation={avg_dev:.2f} final_severity={final_severity}")
+
             violation_summary = "; ".join([v['violation'] for v in anomaly_details['violations']])
             raw_values = json.dumps(readings, cls=CustomJSONEncoder, default=str)
             cursor = conn.cursor()
@@ -679,7 +726,7 @@ def insert_reading():
                     raw_values,
                     'Rule_Based_Frontend',
                     'New',
-                    calculated_severity,
+                    final_severity,
                     lift_type # Use lift_type as category
                 )
                 cursor.execute(
@@ -822,6 +869,27 @@ def insert_reading():
             if suggestion_result is None:
                 suggestion_result = {}
             suggestion_result['asset_id'] = asset_id
+
+            # Enforce severity and confidence to match precomputed severity/anomaly_score
+            try:
+                # Recompute final severity based on possibly augmented anomaly_details
+                forced_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
+                a_score = float(anomaly_details.get('anomaly_score', 0.0) or 0.0)
+
+                # Map anomaly_score (0.0-1.0) directly to a percentage for tighter fidelity.
+                # Round to nearest integer and clamp to [1,99] to avoid 0% or 100% extremes.
+                try:
+                    conf_val = int(round(max(0.0, min(1.0, a_score)) * 100))
+                except Exception:
+                    conf_val = 0
+                conf_val = max(1, min(99, conf_val))
+
+                suggestion_result['severity'] = forced_severity
+                suggestion_result['confidence'] = f"{int(conf_val)}%"
+                logging.info(f"[SuggestionOverride] well={well_id} forced_severity={forced_severity} anomaly_score={a_score:.3f} confidence={conf_val}%")
+            except Exception:
+                # If anything goes wrong, keep the AI-provided values
+                logging.exception("Failed to enforce suggestion severity/confidence; leaving AI output as-is")
 
             # 5. Store Suggestion in Postgres
             pg_conn_insert = get_pg_connection()

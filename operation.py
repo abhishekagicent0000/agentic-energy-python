@@ -67,6 +67,7 @@ def create_operation_suggestion_table():
         CREATE TABLE IF NOT EXISTS operation_suggestion (
             id VARCHAR(50) PRIMARY KEY,
             well_id VARCHAR(50) NOT NULL,
+            category VARCHAR(50) DEFAULT 'Production',
             action VARCHAR(255) NOT NULL,
             status VARCHAR(50) DEFAULT 'New',
             priority VARCHAR(50) DEFAULT 'HIGH',
@@ -188,6 +189,8 @@ Provide a comprehensive analysis in the following JSON format:
         "supporting_analysis": "<detailed supporting analysis with references>",
         "data_quality": "<High/Medium/Low confidence description>"
     }}
+    ,
+    "category": "Production|Optimization|Maintenance"
 }}
 
 Ensure all fields are present and the output is valid JSON."""
@@ -252,7 +255,7 @@ Ensure all fields are present and the output is valid JSON."""
         }
 
 
-def save_operation_suggestion(well_id: str, action: str, status: str = "New",
+def save_operation_suggestion(well_id: str, action: str, category: str = "Production", status: str = "New",
                              priority: str = "HIGH", confidence: float = 0.0,
                              production_data: dict = None, sensor_metrics: dict = None,
                              reason: str = "", expected_impact: str = "") -> bool:
@@ -296,7 +299,7 @@ def save_operation_suggestion(well_id: str, action: str, status: str = "New",
         # Prepare insert statement
         insert_sql = """
         INSERT INTO operation_suggestion (
-            id, well_id, action, status, priority, confidence_percent,
+            id, well_id, category, action, status, priority, confidence_percent,
             production_increase_bbl_day, production_increase_percent,
             daily_expense_benefit_usd, implementation_cost_usd, net_daily_benefit_usd,
             asset_value_increase_usd, time_reduced_hours,
@@ -305,7 +308,7 @@ def save_operation_suggestion(well_id: str, action: str, status: str = "New",
             citations, referenced_data, supporting_analysis, data_quality,
             reason, expected_impact, metrics_json, created_at
         ) VALUES (
-            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s
@@ -315,6 +318,7 @@ def save_operation_suggestion(well_id: str, action: str, status: str = "New",
         values = (
             str(uuid4()),  # id
             well_id,  # well_id
+            category,  # category
             action,  # action
             status,  # status
             priority,  # priority
@@ -370,7 +374,7 @@ def save_operation_suggestion(well_id: str, action: str, status: str = "New",
 
 
 def get_operation_suggestions(well_id: str = None, status: str = None, 
-                             priority: str = None, limit: int = 100) -> list:
+                             priority: str = None, category: str = None, limit: int = 100) -> list:
     """
     Retrieve operation suggestions from PostgreSQL.
     
@@ -404,6 +408,10 @@ def get_operation_suggestions(well_id: str = None, status: str = None,
         if priority:
             query += " AND priority = %s"
             params.append(priority)
+
+        if category:
+            query += " AND category = %s"
+            params.append(category)
 
         query += " ORDER BY created_at DESC LIMIT %s"
         params.append(limit)
