@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import time
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 from snowflake.connector import connect as snowflake_connect
@@ -119,7 +120,8 @@ def insert_anomalies_to_db(results):
     """
     Helper to persist results to Snowflake 'well_anomalies' table.
     """
-    if not results: return
+    if not results: 
+        return
     
     try:
         conn = get_snowflake_conn()
@@ -127,38 +129,40 @@ def insert_anomalies_to_db(results):
         
         insert_data = []
         for r in results:
-            # Map result dict to DB schema columns
-            # Schema: well_id, timestamp, anomaly_type, anomaly_score, raw_values, model_name, status, severity, category
-            # Note: detect_anomalies output structure might differ slightly, adapted here.
-            
-            # r has: well_id, timestamp, category, severity, title, ui_text, ...
-            
-            # Assuming 'anomaly_score' isn't explicitly in r, use 1.0 or derive
-            # stored raw_values ?? -> r doesn't have raw values of all sensors, maybe skip or json dump the context
+            # Prepare JSON content as string
+            raw_values_json = json.dumps(r['ui_text'])
             
             insert_data.append((
                 r['well_id'],
                 r['timestamp'],
                 r['title'],     # anomaly_type
-                1.0,            # score (logic engine is binary trigger, implicitly high confidence)
-                json.dumps(r['ui_text']), # raw_values (using narrative as context payload)
+                1.0,            # score
+                raw_values_json,  # raw_values as JSON string
                 'Logic_Engine_v2', # model_name
                 'New',          # status
                 r['severity'],
                 r['category']
             ))
-            
+        
         if insert_data:
-            cursor.executemany("""
+            # Use strict loop to handle PARSE_JSON safely (executemany can fail with function calls in VALUES)
+            insert_query = """
                 INSERT INTO well_anomalies 
-                (well_id, timestamp, anomaly_type, anomaly_score, raw_values, model_name, status, severity, category)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, insert_data)
+                (well_id, timestamp, anomaly_type, anomaly_score, raw_values, 
+                 model_name, status, severity, category)
+                VALUES (%s, %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, %s)
+            """
+            for row in insert_data:
+                cursor.execute(insert_query, row)
+
+            conn.commit()
+            logger.info(f"✓ Inserted {len(insert_data)} anomalies to Snowflake well_anomalies table.")
             
         conn.close()
     except Exception as e:
         logger.error(f"DB Insert Failed: {e}")
-        import json # valid fallback
+        import traceback
+        logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
     run_batch()

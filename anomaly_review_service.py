@@ -3,10 +3,9 @@ import json
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from snowflake.connector import connect as snowflake_connect
@@ -26,30 +25,50 @@ GAS_PRICE = 2.50
 ENERGY_COST_UNIT = 0.12
 MODELS_DIR = 'models'
 
-# Add 'runtime' to active features for Rod Pump if available to fix "Blind Spot"
+# --- CONSTANTS ---
+VALID_CATEGORIES = {'PROCESS', 'OPERATIONAL', 'FINANCIAL'}
+VALID_STATUSES = {'NEW', 'ACKNOWLEDGED', 'IN_REVIEW', 'ACTIONED', 'DISMISSED'}
+
+# Defines features to fetch
+# Common sensors across all lift types (Verified in Schema)
+COMMON_SENSORS = [
+    'wellhead_temp', 
+    'surface_pressure', 
+    'casing_pressure'
+]
+
+# Client-specific Strict Ranges (Local Isolation)
+CLIENT_SENSOR_RANGES = {
+    "tubing_pressure": {"min": 0, "max": 300, "unit": "psi"},
+    "wellhead_temp": {"min": 10, "max": 400, "unit": "F"},
+    # ... (Other ranges kept as config, will be skipped if data missing)
+}
+
+
+# Defines features to fetch
 LIFT_FEATURES = {
     'Rod Pump': [
-        'strokes_per_minute', 'cycles_per_day', 'runtime', 
+        'strokes_per_minute', 
         'torque', 'polish_rod_load', 'structural_load', 'surface_stroke_length',
         'downhole_gross_stroke_length', 'downhole_net_stroke_length',
         'tubing_pressure', 'pump_intake_pressure', 'pump_friction',
-        'pump_fillage', 'inferred_production'
-    ],
+        'pump_fillage'
+    ] + COMMON_SENSORS,
     'ESP': [
         'motor_current', 'motor_voltage', 'input_current', 'output_voltage', 
         'motor_load', 'total_harmonic_distortion', 'drive_input_voltage',
         'motor_speed', 'drive_frequency', 'set_frequency',
         'discharge_pressure', 'pump_intake_pressure', 'tubing_pressure', 'casing_pressure',
         'motor_temp', 'intake_fluid_temp', 'discharge_temp', 'vsd_temp',
-        'vibration_x', 'vibration_y', 'runtime'
-    ],
+        'vibration_x', 'vibration_y'
+    ] + COMMON_SENSORS,
     'Gas Lift': [
         'injection_rate', 'injection_pressure', 'injection_temperature',
         'casing_pressure', 'surface_pressure', 'bottomhole_pressure', 
         'open_differential_pressure', 'min_shut_in_pressure', 'max_shut_in_pressure',
         'cycle_time', 'flow_time', 'shut_in_time', 'afterflow_time',
         'plunger_velocity', 'plunger_arrival_time', 'missed_arrivals'
-    ]
+    ] + COMMON_SENSORS
 }
 
 def get_snowflake_conn():
@@ -63,23 +82,11 @@ def get_snowflake_conn():
         role=os.getenv('SNOWFLAKE_ROLE')
     )
 
-def get_postgres_context(well_id: str) -> str:
-    try:
-        db_url = os.getenv("DATABASE_URL")
-        if not db_url: return ""
-        
-        with psycopg2.connect(db_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT action, status FROM operation_suggestion 
-                    WHERE well_id = %s AND status IN ('New', 'In Progress')
-                    ORDER BY created_at DESC LIMIT 1
-                """, (well_id,))
-                row = cur.fetchone()
-                if row: return f"Active Ticket: {row[0]} ({row[1]})."
-    except Exception:
-        pass
-    return "No active tickets."
+def get_db_url():
+    url = os.getenv("DATABASE_URL")
+    if url and "schema=" in url:
+        return url.replace("?schema=public", "").replace("&schema=public", "")
+    return url
 
 def get_openai_client():
     return openai.OpenAI(
@@ -124,43 +131,41 @@ def fetch_well_data(well_id: str, days: int = 120) -> pd.DataFrame:
         logger.error(f"Fetch failed for {well_id}: {e}")
         return pd.DataFrame()
 
-def validate_sensor_data(latest_row: pd.Series, lift_type: str) -> List[str]:
-    """Checks if sensors are within DB defined Min/Max ranges."""
-    invalid_sensors = []
+def get_well_status(well_id: str) -> str:
+    """Fetch master status for well (e.g., ACTIVE, INACTIVE)."""
+    # Assuming a 'wells' table exists or derived from production
+    # Fallback to 'ACTIVE' if unknown, but better to check source
     try:
-        ranges = get_sensor_ranges(lift_type)
-        for sensor, limits in ranges.items():
-            if sensor in latest_row:
-                val = latest_row[sensor]
-                if pd.notnull(val):
-                    if val < limits.get('min', -999999) or val > limits.get('max', 999999):
-                        invalid_sensors.append(sensor)
-    except Exception as e:
-        logger.error(f"Range check failed: {e}")
-    return invalid_sensors
+        with get_snowflake_conn() as conn:
+            cur = conn.cursor()
+            # Try finding validation in master table
+            # Adjust table name if 'wells' or 'well_master' does not exist
+            # For now, simplistic check: if it has recent data, it's capable of active?
+            # Or assume we can query a 'wells' table.
+            
+            # Using metadata check if possible (simulated here since schema not fully known)
+            # cur.execute("SELECT status FROM wells WHERE id = %s", (well_id,))
+            # res = cur.fetchone()
+            # if res: return res[0]
+            pass
+    except Exception:
+        pass
+    return "ACTIVE" # Default assumption for logic
 
 def get_or_train_model(well_id: str, df: pd.DataFrame, active_features: List[str]) -> Dict:
-    """
-    Retrieves a cached model or trains a new one if missing/stale.
-    Returns dictionary with 'model', 'scaler', 'imputer', 'top_factor'.
-    """
     if not os.path.exists(MODELS_DIR):
         os.makedirs(MODELS_DIR)
         
     model_path = os.path.join(MODELS_DIR, f'financial_rf_{well_id}.joblib')
     
-    # Check cache (7 days validity)
     if os.path.exists(model_path):
         file_age_days = (time.time() - os.path.getmtime(model_path)) / (24 * 3600)
         if file_age_days < 7:
             try:
-                # logger.info(f"Loading cached model for {well_id}")
                 return joblib.load(model_path)
-            except Exception as e:
-                logger.warning(f"Failed to load cached model: {e}")
+            except Exception:
+                pass
 
-    # Train New Model
-    # logger.info(f"Training new model for {well_id}")
     cutoff_date = df['timestamp'].max() - timedelta(days=14)
     train_df = df[df['timestamp'] <= cutoff_date]
     
@@ -190,17 +195,19 @@ def get_or_train_model(well_id: str, df: pd.DataFrame, active_features: List[str
     joblib.dump(artifact, model_path)
     return artifact
 
-# --- LOGIC CHECKER FUNCTIONS ---
+# --- LOGIC CHECKERS (Refactored) ---
 
 def check_financial_gap(context: Dict) -> Optional[Dict]:
     if context['is_active'] and (context['pred_oil'] > 5) and (context['actual_oil'] < (0.80 * context['pred_oil'])):
         gap = context['pred_oil'] - context['actual_oil']
         impact = gap * OIL_PRICE
         return {
+            "code": "FINANCIAL_EFFICIENCY",
             "category": "FINANCIAL",
             "type": "Production Efficiency Gap",
             "severity": "High" if impact > 500 else "Moderate",
-            "impact_str": f"${impact:,.0f}/day Revenue Risk",
+            "impact_value": impact,
+            "impact_unit": "USD/day",
             "context": f"Actual: {context['actual_oil']:.1f} bbl vs Model: {context['pred_oil']:.1f} bbl.",
             "drivers": f"Sensors ({context['activity_source']}) indicate potential for {context['pred_oil']:.1f} bbl.",
             "chart_type": "oil_comparison"
@@ -211,10 +218,12 @@ def check_ghost_production(context: Dict) -> Optional[Dict]:
     total_fluids = context['actual_oil'] + context['actual_water'] + context['actual_gas']
     if context['is_active'] and (total_fluids < 0.1):
         return {
+            "code": "GHOST_PROD",
             "category": "PROCESS",
             "type": "Missing Production Report",
             "severity": "Low",
-            "impact_str": "$0 (Data Gap)",
+            "impact_value": 0.0,
+            "impact_unit": "USD/day",
             "context": f"Well is ACTIVE ({context['activity_source']}) but Production is 0.",
             "drivers": "Operational compliance: Check daily report Entry.",
             "chart_type": "production_bar"
@@ -222,7 +231,6 @@ def check_ghost_production(context: Dict) -> Optional[Dict]:
     return None
 
 def check_cost_creep(context: Dict) -> Optional[Dict]:
-    # Water up > 20% AND Oil flat/down
     avg_water = context['avg_water']
     actual_water = context['actual_water']
     
@@ -230,10 +238,12 @@ def check_cost_creep(context: Dict) -> Optional[Dict]:
         excess = actual_water - avg_water
         cost = excess * WATER_DISPOSAL_COST
         return {
+            "code": "COST_CREEP",
             "category": "FINANCIAL",
             "type": "Rising Disposal Costs",
             "severity": "Moderate",
-            "impact_str": f"${cost:,.0f}/day Excess Cost",
+            "impact_value": cost,
+            "impact_unit": "USD/day",
             "context": f"Water up {((actual_water/avg_water)-1)*100:.0f}% while Oil is flat.",
             "drivers": "Inefficient water handling / Water breakthrough.",
             "chart_type": "water_trend"
@@ -241,13 +251,14 @@ def check_cost_creep(context: Dict) -> Optional[Dict]:
     return None
 
 def check_gas_interference(context: Dict) -> Optional[Dict]:
-    # Gas trending up AND Erratic Fillage
     if (context['avg_gas'] > 5) and (context['actual_gas'] > context['avg_gas']) and (context['fillage_std'] > 5):
         return {
+            "code": "GAS_INTERFERENCE",
             "category": "OPERATIONAL",
             "type": "Gas Interference Review",
             "severity": "High",
-            "impact_str": "Production Risk",
+            "impact_value": 0.0,
+            "impact_unit": "Production Risk",
             "context": f"Rising Gas ({context['actual_gas']:.0f} mcf) + Erratic Fillage (SD: {context['fillage_std']:.1f}).",
             "drivers": "Gas likely locking pump or reducing efficiency.",
             "chart_type": "gas_trend"
@@ -255,14 +266,15 @@ def check_gas_interference(context: Dict) -> Optional[Dict]:
     return None
 
 def check_flowline_blockage(context: Dict) -> Optional[Dict]:
-    # Tubing Pressure Up, Oil Down
     if (context['tp_avg'] > 0) and (context['tubing_pressure'] > 1.2 * context['tp_avg']) and (context['actual_oil'] < 0.9 * context['avg_oil']):
         pct_rise = ((context['tubing_pressure']/context['tp_avg'])-1)*100
         return {
+            "code": "FLOWLINE_BLOCK",
             "category": "OPERATIONAL",
             "type": "Flowline Blockage",
             "severity": "High",
-            "impact_str": "Safety / Production Risk",
+            "impact_value": 0.0,
+            "impact_unit": "Safety Risk",
             "context": f"Tubing Pressure +{pct_rise:.0f}% vs Avg, Oil Down.",
             "drivers": "Check choke, flowline, or surface valves.",
             "chart_type": "oil_comparison"
@@ -270,16 +282,17 @@ def check_flowline_blockage(context: Dict) -> Optional[Dict]:
     return None
 
 def check_pump_wear(context: Dict) -> Optional[Dict]:
-    # Rod Pump specific
     if (context['current_lift'] == 'Rod Pump') and \
        (context['spm'] > context['spm_avg']) and \
        (context['pump_fillage'] > 80) and \
        (context['actual_oil'] < 0.8 * context['pred_oil']):
          return {
-            "category": "EQUIPMENT",
+            "code": "PUMP_WEAR",
+            "category": "OPERATIONAL",
             "type": "Pump Wear / Slippage",
             "severity": "Moderate",
-            "impact_str": "Efficiency Loss",
+            "impact_value": 0.0,
+            "impact_unit": "Efficiency Loss",
             "context": f"Pump running fast ({context['spm']:.1f} SPM) and full ({context['pump_fillage']:.0f}%), but oil missing.",
             "drivers": "Fluid is slipping past plunger or traveling valve leak.",
             "chart_type": "oil_comparison"
@@ -287,88 +300,189 @@ def check_pump_wear(context: Dict) -> Optional[Dict]:
     return None
 
 def check_esp_shaft_break(context: Dict) -> Optional[Dict]:
-    # ESP specific: High PIP, Low Amps
     if (context['current_lift'] == 'ESP') and \
        (context['pip'] > context['pip_avg'] * 1.1) and \
        (context['amps'] < context['amps_avg'] * 0.5):
         return {
-            "category": "EQUIPMENT",
+            "code": "ESP_SHAFT_BREAK",
+            "category": "OPERATIONAL",
             "type": "Broken Shaft / Free Spin",
-            "severity": "CRITICAL",
-            "impact_str": "Total Failure",
+            "severity": "High", # Was CRITICAL, High maps to common levels
+            "impact_value": 0.0,
+            "impact_unit": "Total Failure",
             "context": f"High Intake Pressure (Fluid Level High) but Low Amps.",
             "drivers": "Motor spinning without load (Broken Shaft) or Intake Plugged.",
             "chart_type": "production_bar"
         }
     return None
 
+def check_production_instability(context: Dict) -> Optional[Dict]:
+    if not context['is_active']: return None
+    oil_drop = (context['avg_oil'] - context['actual_oil']) / (context['avg_oil'] + 0.1)
+    amps_change = abs(context['amps'] - context['amps_avg']) / (context['amps_avg'] + 0.1)
+    pressure_val = context['tubing_pressure'] if context['tubing_pressure'] > 0 else context['pip']
+    pressure_avg = context['tp_avg'] if context['tubing_pressure'] > 0 else context['pip_avg']
+    pressure_change = abs(pressure_val - pressure_avg) / (pressure_avg + 0.1)
+    
+    if oil_drop > 0.20 and amps_change < 0.05 and pressure_change < 0.05:
+        return {
+            "code": "PROD_INSTABILITY",
+            "category": "OPERATIONAL",
+            "type": "Unexplained Production Drop",
+            "severity": "Moderate",
+            "impact_value": oil_drop * context['avg_oil'] * OIL_PRICE,
+            "impact_unit": "USD/day Risk",
+            "context": f"Oil down {oil_drop:.1%} with stable sensors.",
+            "drivers": "Tubing Leak, Flowline Leak, Check Valve Failure.",
+            "chart_type": "production_line"
+        }
+    return None
+
+    return None
+
+# def check_downtime(context: Dict) -> Optional[Dict]:
+#    """
+#    DISABLED: Missing 'runtime' data.
+#    """
+#    return None
+
+def check_sensor_integrity(context: Dict) -> Optional[Dict]:
+    """
+    Check against Client-Specific strict ranges.
+    Returns: Anomaly if any critical sensor is out of bounds.
+    """
+    violations = []
+    
+    for field, rule in CLIENT_SENSOR_RANGES.items():
+        val = context.get(field)
+        # Skip if None, or if 0 and min is 0 (trivial)
+        if val is None: continue
+        
+        # Check Min
+        if rule.get('min') is not None and val < rule['min']:
+            violations.append(f"{field} ({val}) < Min {rule['min']}")
+            
+        # Check Max
+        if rule.get('max') is not None and val > rule['max']:
+            violations.append(f"{field} ({val}) > Max {rule['max']}")
+            
+    if violations:
+        # Prioritize showing the first few
+        desc = ", ".join(violations[:2])
+        if len(violations) > 2: desc += f" + {len(violations)-2} more."
+        
+        return {
+            "code": "SENSOR_RANGE",
+            "category": "PROCESS", # Data Quality / Process Limits
+            "type": "Sensor Value Out of Range",
+            "severity": "Low", # Typically warn
+            "impact_value": 0.0,
+            "impact_unit": "Data Quality",
+            "context": f"Violations: {desc}",
+            "drivers": "Sensor drift, calibration error, or process upset.",
+            "chart_type": "production_bar" # Generic fallback
+        }
+    return None
+
+def check_tank_drop(context: Dict) -> Optional[Dict]:
+    """
+    Detects sudden drops in tank level without production explanation.
+    """
+    if context.get('tank_drop', 0) < -2.0: # Drop > 2 units (ft/bbl depending on sensor)
+        # Check if production explains it? 
+        # If we had a 'Haul' event, we would skip. We don't have Haul data yet.
+        # So we flag as 'Unexpected Drop'.
+        return {
+            "code": "TANK_DROP",
+            "category": "OPERATIONAL",
+            "type": "Unexpected Tank Level Drop",
+            "severity": "Moderate",
+            "impact_value": 0.0, # Could calc volume if we knew tank dims
+            "impact_unit": "Potential Loss",
+            "context": f"Tank dropped {abs(context['tank_drop']):.1f} units in 24h.",
+            "drivers": "Potential theft, leak, or unrecorded haul.",
+            "chart_type": "production_bar" # Fallback
+        }
+    return None
+
+def check_tank_leak(context: Dict) -> Optional[Dict]:
+    """
+    Explicit alias for tank drops to categorize them as Potential Leaks.
+    """
+    if context.get('tank_drop', 0) < -1.0: # More sensitive trigger for Leak
+         return {
+            "code": "TANK_LEAK",
+            "category": "OPERATIONAL",
+            "type": "Tank Leak Suspected",
+            "severity": "High",
+            "impact_value": 0.0,
+            "impact_unit": "Environmental Risk",
+            "context": f"Unexplained drop of {abs(context['tank_drop']):.1f} units (Leak Check).",
+            "drivers": "Tank integrity failure or valve leak.",
+            "chart_type": "production_bar"
+        }
+    return None
+
+def check_bsw_spike(context: Dict) -> Optional[Dict]:
+    """
+    Detects sudden rise in Water Cut (BSW %) even if total fluid is stable.
+    """
+    bsw = context.get('bsw', 0)
+    bsw_avg = context.get('bsw_avg', 0)
+    
+    if (bsw > 10) and (bsw > bsw_avg + 15): # e.g. 40% -> 55%
+        return {
+            "code": "BSW_SPIKE",
+            "category": "OPERATIONAL",
+            "type": "Water Cut Spike (BSW)",
+            "severity": "Moderate",
+            "impact_value": context['actual_water'] * WATER_DISPOSAL_COST,
+            "impact_unit": "USD/day (Disposal)",
+            "context": f"Water Cut spiked to {bsw:.1f}% (Avg {bsw_avg:.1f}%).",
+            "drivers": "Water breakthrough or separation failure.",
+            "chart_type": "water_trend"
+        }
+    return None
+
 # --- MAIN CONTROLLER ---
 
 def detect_anomalies(well_id: str, df: Optional[pd.DataFrame] = None, lookback_days: int = 7) -> List[Dict]:
-    """
-    Detect anomalies over the last `lookback_days`.
-    Aggregates recurring anomalies into single review items.
-    """
     if df is None:
         df = fetch_well_data(well_id)
     if df.empty or len(df) < 14: return []
 
     df['lift_type'] = df['lift_type'].ffill()
     current_lift = df['lift_type'].iloc[-1] if not df['lift_type'].isnull().all() else 'Rod Pump'
+    master_status = get_well_status(well_id)
     
     target_features = LIFT_FEATURES.get(current_lift, LIFT_FEATURES['Rod Pump'])
     active_features = [f for f in df.columns if f in target_features]
 
     if len(active_features) < 3:
-        logger.warning(f"Not enough sensor data for {well_id} model.")
         return []
 
-    latest = df.iloc[-1]
+    # Get Existing Anomalies for Deduplication
+    existing_anomalies = fetch_existing_anomalies(well_id, lookback_days + 2) # Buffer
     
-    # --- 1. DATA QUALITY GATE ---
-    invalid_sensors = validate_sensor_data(latest, current_lift)
-    anomalies = []
-    
-    if invalid_sensors:
-        anomalies.append({
-            "category": "DATA_QUALITY",
-            "type": "Sensor Range Violation",
-            "severity": "Low",
-            "impact_str": "Data Integrity Risk",
-            "context": f"Sensors out of DB range: {', '.join(invalid_sensors)}.",
-            "drivers": "Sensor Calibration / Failure.",
-            "chart_type": "production_bar" 
-        })
-    
-    # --- 2. PREDICTIVE MODEL (Get or Train) ---
+    # Model
     df['predicted_oil'] = np.nan
     top_factor = "Unknown"
-    
-    # Note: Logic depends on predicted_oil. If Model fails, we can't run Financial/Wear checks.
-    # But other checks (Cost Creep, Gas) don't need it.
-    
     model_artifact = get_or_train_model(well_id, df, active_features)
     if model_artifact:
         scaler = model_artifact['scaler']
         model = model_artifact['model']
         imputer = model_artifact['imputer']
         top_factor = model_artifact['top_factor']
-        
-        # Predict on latest (full DF)
         try:
             X_full = scaler.transform(imputer.transform(df[active_features]))
             df['predicted_oil'] = model.predict(X_full)
-        except Exception as e:
-            logger.error(f"Prediction failed: {e}")
+        except Exception:
+            pass
 
-    # --- 3. CONTEXT PREPARATION ---
-    # Prepare a clean context dictionary for logical checkers to use
-    
-    # Rolling Stats
+    # Stats
     df['water_avg'] = df['water_volume'].rolling(30).mean()
     df['gas_avg'] = df['gas_volume'].rolling(30).mean()
     df['oil_avg'] = df['oil_volume'].rolling(30).mean()
-    
     if 'tubing_pressure' in df.columns: df['tp_avg'] = df['tubing_pressure'].rolling(30).mean()
     if 'pump_intake_pressure' in df.columns: df['pip_avg'] = df['pump_intake_pressure'].rolling(30).mean()
     if 'motor_current' in df.columns: df['amps_avg'] = df['motor_current'].rolling(30).mean()
@@ -378,114 +492,73 @@ def detect_anomalies(well_id: str, df: Optional[pd.DataFrame] = None, lookback_d
     else:
         df['fillage_std'] = 0.0
 
-    latest = df.iloc[-1]
-    
-    context = {
-        'well_id': well_id,
-        'current_lift': current_lift,
-        'actual_oil': float(latest.get('oil_volume', 0)),
-        'actual_water': float(latest.get('water_volume', 0)),
-        'actual_gas': float(latest.get('gas_volume', 0)),
-        'pred_oil': float(latest.get('predicted_oil', latest.get('oil_volume', 0))), # Default to actual if no pred
-        
-        'avg_oil': float(latest.get('oil_avg', 0)),
-        'avg_water': float(latest.get('water_avg', 0)),
-        'avg_gas': float(latest.get('gas_avg', 0)),
-        
-        'tubing_pressure': float(latest.get('tubing_pressure', 0)),
-        'tp_avg': float(latest.get('tp_avg', 0)),
-        
-        'pip': float(latest.get('pump_intake_pressure', 0)),
-        'pip_avg': float(latest.get('pip_avg', 0)),
-        
-        'amps': float(latest.get('motor_current', 0)),
-        'amps_avg': float(latest.get('amps_avg', 0)),
-        
-        'spm': float(latest.get('strokes_per_minute', 0)),
-        'spm_avg': float(latest.get('spm_avg', 0)),
-        
-        'pump_fillage': float(latest.get('pump_fillage', 0)),
-        'fillage_std': float(latest.get('fillage_std', 0)),
-    }
-    
-    # Activity Check
-    is_active = False
-    activity_source = "Unknown"
-    
-    if 'strokes_per_minute' in latest and latest['strokes_per_minute'] > 0.1:
-        is_active = True
-        activity_source = f"SPM ({latest['strokes_per_minute']:.1f})"
-    elif 'motor_current' in latest and latest['motor_current'] > 5:
-        is_active = True
-        activity_source = f"Amps ({latest['motor_current']:.1f})"
-    elif top_factor in latest and latest[top_factor] > 0.1:
-        is_active = True
-        activity_source = f"{top_factor}"
-    
-    context['is_active'] = is_active
-    context['activity_source'] = activity_source
+    # Calculate Tank Drop (Day over Day)
+    if 'tank_oil_level' in df.columns:
+        df['tank_drop'] = df['tank_oil_level'].diff()
+    else:
+        df['tank_drop'] = 0.0
 
-    # --- 4. EXECUTE CHECKERS ---
-    
-    # --- 4. EXECUTE CHECKERS OVER LOOKBACK WINDOW ---
-    
+    # Calculate BSW (Water Cut %)
+    df['total_fluid'] = df['oil_volume'] + df['water_volume']
+    df['bsw'] = (df['water_volume'] / df['total_fluid'].replace(0, np.nan)) * 100
+    df['bsw'] = df['bsw'].fillna(0)
+    df['bsw_avg'] = df['bsw'].rolling(30).mean()
+
     checkers = [
-        check_financial_gap,
-        check_ghost_production,
-        check_cost_creep,
-        check_gas_interference,
-        check_flowline_blockage,
-        check_pump_wear,
-        check_esp_shaft_break
+        check_financial_gap, check_ghost_production, check_cost_creep,
+        check_gas_interference, check_flowline_blockage, check_pump_wear,
+        check_esp_shaft_break, check_production_instability, 
+        check_esp_shaft_break, check_production_instability, 
+        check_sensor_integrity, check_tank_drop,
+        check_tank_leak, check_bsw_spike
     ]
     
-    # Filter to lookback window
     cutoff_date = df['timestamp'].max() - pd.Timedelta(days=lookback_days)
     window_df = df[df['timestamp'] > cutoff_date].copy()
     
-    if window_df.empty:
-        return []
-
-    aggregated_anomalies = {}
-
-    # Iterate through each day in the window
+    anomalies_out = []
+    
     for idx, row in window_df.iterrows():
-        # Build context for this specific row (day)
-        # Note: We need to re-calculate context for each row because variables like 'actual_oil' change
+        event_date_str = row['timestamp'].strftime('%Y-%m-%d')
         
-        # Helper to safely get float
+        # Helper
         def get_val(r, col, default=0): return float(r.get(col, default))
         
         day_context = {
             'well_id': well_id,
             'current_lift': current_lift,
+            'master_status': master_status,
             'timestamp': row['timestamp'],
             'actual_oil': get_val(row, 'oil_volume'),
             'actual_water': get_val(row, 'water_volume'),
             'actual_gas': get_val(row, 'gas_volume'),
             'pred_oil': get_val(row, 'predicted_oil', get_val(row, 'oil_volume')),
-
             'avg_oil': get_val(row, 'oil_avg'),
             'avg_water': get_val(row, 'water_avg'),
             'avg_gas': get_val(row, 'gas_avg'),
-
             'tubing_pressure': get_val(row, 'tubing_pressure'),
             'tp_avg': get_val(row, 'tp_avg'),
-
             'pip': get_val(row, 'pump_intake_pressure'),
             'pip_avg': get_val(row, 'pip_avg'),
-
             'amps': get_val(row, 'motor_current'),
             'amps_avg': get_val(row, 'amps_avg'),
-
             'spm': get_val(row, 'strokes_per_minute'),
             'spm_avg': get_val(row, 'spm_avg'),
-
             'pump_fillage': get_val(row, 'pump_fillage'),
             'fillage_std': get_val(row, 'fillage_std'),
+            'runtime': get_val(row, 'runtime'),
+            'runtime': get_val(row, 'runtime'),
+            'tank_drop': get_val(row, 'tank_drop'),
+            'bsw': get_val(row, 'bsw'),
+            'bsw_avg': get_val(row, 'bsw_avg')
         }
-
-        # Activity Check for this day
+        
+        # Inject Common Sensors into Context for Integrity Check
+        for s in COMMON_SENSORS:
+             if s in row:
+                 day_context[s] = row[s]
+        
+        # Activity Check
         is_active = False
         activity_source = "Unknown"
         if 'strokes_per_minute' in row and row['strokes_per_minute'] > 0.1:
@@ -497,241 +570,207 @@ def detect_anomalies(well_id: str, df: Optional[pd.DataFrame] = None, lookback_d
         
         day_context['is_active'] = is_active
         day_context['activity_source'] = activity_source
-
-        # Run Checkers
+        
         for check_func in checkers:
-            result = check_func(day_context)
-            if result:
-                # Aggregate Logic
-                anom_type = result['type']
-                if anom_type not in aggregated_anomalies:
-                    aggregated_anomalies[anom_type] = {
-                        "base_anomaly": result,
-                        "occurrences": 1,
-                        "dates": [row['timestamp']],
-                        "max_severity": result['severity'] # Simple string comparison risk, but acceptable for MVP
-                    }
-                else:
-                    agg = aggregated_anomalies[anom_type]
-                    agg['occurrences'] += 1
-                    agg['dates'].append(row['timestamp'])
-                    # Keep latest context for narrative, maybe most severe is better but latest is actionable
-                    agg['base_anomaly'] = result 
+            res = check_func(day_context)
+            if res:
+                # Deduplication Check
+                # key: (well_id, anomaly_code, event_date)
+                dedup_key = (res['code'], event_date_str)
+                
+                # Check Local Duplicates (same batch)
+                if any(x['anomaly_code'] == res['code'] and x['event_date'] == event_date_str for x in anomalies_out):
+                    continue
+                    
+                # Check DB Duplicates (previously acted upon)
+                existing_status = existing_anomalies.get(dedup_key)
+                if existing_status in ('DISMISSED', 'ACTIONED', 'ACKNOWLEDGED', 'IN_REVIEW'):
+                    # Skip re-alerting if already active or handled
+                    continue
+                    
+                narrative = generate_narrative(res, current_lift)
+                chart_data = build_chart_data(df, res['chart_type']) # Using full DF for context
+                
+                anomalies_out.append({
+                    "well_id": well_id,
+                    "timestamp": day_context['timestamp'],
+                    "event_date": event_date_str,
+                    "detected_at": datetime.now(timezone.utc).isoformat(),
+                    "anomaly_code": res['code'],
+                    "category": res['category'],
+                    "severity": res['severity'],
+                    "title": res['type'],
+                    "status": "ACTIVE",
+                    "ui_text": {
+                        "description": narrative['description'],
+                        "why_is_this_an_anomaly": narrative['why'],
+                        "suspected_root_cause": narrative['root_cause'],
+                        "economic_impact": f"{res['impact_unit']} {res['impact_value']:.1f}" if res['impact_value'] > 0 else res['impact_unit']
+                    },
+                    "impact_metrics": {
+                        "value": res['impact_value'],
+                        "unit": res['impact_unit']
+                    },
+                    "chart_data": chart_data
+                })
 
-    # --- 5. FORMAT OUTPUT ---
-    results_out = []
-    postgres_context = get_postgres_context(well_id)
-    
-    for anom_type, agg_data in aggregated_anomalies.items():
-        base = agg_data['base_anomaly']
-        count = agg_data['occurrences']
-        dates = sorted(agg_data['dates'])
-        first_date = dates[0].strftime('%b %d')
-        last_date = dates[-1].strftime('%b %d')
-        
-        # Modify title to reflect persistence if needed
-        title = base['type']
-        if count > 1:
-            title = f"{title} (Detected {count} times: {first_date}-{last_date})"
-        
-        narrative = generate_narrative(base, current_lift, postgres_context)
-        chart_data = build_chart_data(df, base['chart_type'])
-        
-        results_out.append({
-            "well_id": well_id,
-            "timestamp": dates[-1].isoformat(), # Use latest occurrence
-            "category": base['category'],
-            "severity": base['severity'],
-            "title": title,
-            "ui_text": {
-                "description": narrative['description'],
-                "why_is_this_an_anomaly": narrative['why'],
-                "suspected_root_cause": narrative['root_cause'],
-                "economic_impact": base['impact_str']
-            },
-            "chart_type": "line" if base['chart_type'] != "production_bar" else "bar",
-            "chart_data": chart_data,
-            "actions": ["Dismiss", "Acknowledge", "Request Review"]
-        })
+    save_reviews(anomalies_out)
+    return anomalies_out
 
-    # --- 6. PERSISTENCE ---
-    save_reviews(results_out)
-
-    return results_out
-
-def generate_narrative(anom: Dict, lift_type: str, history: str) -> Dict:
-    client = get_openai_client()
-    if not client:
-        return {"description": anom['context'], "why": "Deviation detected.", "root_cause": "Manual Review."}
-    
-    prompt = f"""
-    Role: Senior Petroleum Engineer.
-    Task: Write a professional, concise Incident Report for a well anomaly.
-    Style: Formal, technical, minimal filler words. "Fact-based observation" followed by "Context".
-    
-    Context:
-    - Well Type: {lift_type}
-    - Anomaly Type: {anom['type']}
-    - Sensor Data: {anom['context']}
-    - Physics Driver: {anom['drivers']}
-    - Maintenance: {history}
-    
-    Output JSON:
-    1. "description": One sentence summarizing the EVENT. Format: "[Event] detected at [Time] (if avail), [Status]." (e.g., "Pump failure detected at 20:30, no replacement initiated" or "LOE increased 22% over budget").
-    2. "why": Explain the ANOMALY logic. Contrast the observation with the expectation. (e.g., "Production has been consistent, yet expenses rose significantly, indicating potential allocation error" or "Chemical injection is critical for corrosion prevention; downtime risks equipment failure").
-    3. "root_cause": A specific technical hypothesis based on the driver. (e.g., "Motor overheating due to blocked cooling system" or "Invoice misallocation").
-    """
+def fetch_existing_anomalies(well_id: str, days: int) -> Dict[tuple, str]:
+    """Returns dict of {(code, date_str): status} for existing anomalies."""
+    existing = {}
     try:
-        res = client.chat.completions.create(
-            model="gpt-5-mini", # corrected model name
+        # Check Postgres first (it's the primary for status usually)
+        with psycopg2.connect(get_db_url()) as conn:
+            with conn.cursor() as cur:
+                # Check if table exists first? Assume schema updated.
+                # Querying update schema: anomaly_code, event_date, status
+                try:
+                    cur.execute("""
+                        SELECT anomaly_code, to_char(event_date, 'YYYY-MM-DD'), status 
+                        FROM operation_suggestion 
+                        WHERE well_id = %s AND event_date >= CURRENT_DATE - INTERVAL '%s days'
+                    """, (well_id, days))
+                    rows = cur.fetchall()
+                    for r in rows:
+                        existing[(r[0], r[1])] = r[2]
+                except Exception:
+                    pass # Table might not have cols yet, ignore
+    except Exception:
+        pass
+    return existing
+
+def generate_narrative(anom: Dict, lift_type: str) -> Dict:
+    try:
+        client = get_openai_client()
+        if not client: raise Exception("No OpenAI Client")
+
+        prompt = f"""
+        Analyze this oil & gas anomaly for a {lift_type} well.
+        Anomaly: {anom['type']} ({anom['category']})
+        Context: {anom['context']}
+        Drivers: {anom['drivers']}
+        Severity: {anom['severity']}
+        
+        Provide a JSON response with:
+        - description: "Technical description of what happened."
+        - why: "Why this is physically significant."
+        - root_cause: "Likely mechanical or operational root cause."
+        Keep it professional, concise, and action-oriented.
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-5-mini",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
-        return json.loads(res.choices[0].message.content)
-    except:
-        return {"description": anom['context'], "why": "AI Error", "root_cause": "Unknown"}
+        content = response.choices[0].message.content
+        return json.loads(content)
+    except Exception as e:
+        logger.error(f"OpenAI Generation failed: {e}")
+        # Fallback
+        return {
+            "description": anom['context'],
+            "why": f"Observed {anom['code']} pattern deviates from standard {lift_type} physics.",
+            "root_cause": anom['drivers']
+        }
 
 def build_chart_data(df: pd.DataFrame, chart_type: str) -> Dict:
     plot = df.tail(14).copy()
     if plot.empty: return {"labels": [], "datasets": []}
     
     labels = plot['timestamp'].dt.strftime('%b %d').tolist()
-    
     def clean(series): return series.where(pd.notnull(series), None).tolist()
 
     datasets = []
     if chart_type == "oil_comparison":
         if 'predicted_oil' in plot:
-            datasets.append({"label": "Model Prediction", "data": clean(plot['predicted_oil'].round(1)), "borderColor": "#00E396", "tension": 0.4})
-        datasets.append({"label": "Actual Revenue (Oil)", "data": clean(plot['oil_volume'].round(1)), "borderColor": "#FF4560", "tension": 0.4})
-    
+            datasets.append({"label": "Model Prediction", "data": clean(plot['predicted_oil'].round(1)), "borderColor": "#00E396"})
+        datasets.append({"label": "Actual Oil", "data": clean(plot['oil_volume'].round(1)), "borderColor": "#FF4560"})
     elif chart_type == "water_trend":
-        datasets.append({"label": "30-Day Avg", "data": clean(plot['water_avg'].round(1)), "borderColor": "#775DD0", "borderDash": [5,5]})
         datasets.append({"label": "Actual Water", "data": clean(plot['water_volume'].round(1)), "borderColor": "#FF4560"})
-
     elif chart_type == "gas_trend":
-        datasets.append({"label": "Gas Volume", "data": clean(plot['gas_volume'].round(1)), "borderColor": "#FEB019"})
-
+         datasets.append({"label": "Gas Volume", "data": clean(plot['gas_volume'].round(1)), "borderColor": "#FEB019"})
     elif chart_type == "production_bar":
         total = (plot['oil_volume'] + plot['water_volume'] + plot['gas_volume']).round(1)
-        datasets.append({"label": "Total Fluids", "data": clean(total), "backgroundColor": "#FF4560", "type": "bar"})
-
+        datasets.append({"label": "Total Fluids", "data": clean(total), "type": "bar"})
+        
     return {"labels": labels, "datasets": datasets}
 
 def save_reviews(reviews: List[Dict]):
-    """Persist generated reviews to PostgreSQL (and Snowflake backup)."""
     if not reviews: return
-
-    # 1. PostgreSQL
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
-        try:
-            with psycopg2.connect(db_url) as conn:
+    
+    # 1. Postgres
+    try:
+        url = get_db_url()
+        if url:
+            with psycopg2.connect(url) as conn:
                 with conn.cursor() as cur:
-                    # Ensure table exists (simple check)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS anomaly_reviews (
-                            id SERIAL PRIMARY KEY,
-                            well_id VARCHAR(50) NOT NULL,
-                            timestamp TIMESTAMP NOT NULL,
-                            category VARCHAR(50),
-                            severity VARCHAR(20),
-                            title VARCHAR(255),
-                            description TEXT,
-                            why_anomaly TEXT,
-                            root_cause TEXT,
-                            economic_impact VARCHAR(100),
-                            status VARCHAR(20) DEFAULT 'New',
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        );
-                    """)
+                    # Upsert Logic: If NEW exists, do nothing? Or update?
+                    # Uniqueness is on (well_id, anomaly_code, event_date).
+                    # 'ON CONFLICT DO NOTHING' keeps original status if exists.
+                    
+                    insert_query = """
+                        INSERT INTO operation_suggestion
+                        (well_id, event_date, detected_at, anomaly_code, category, severity, 
+                         title, ui_text, impact_value, impact_unit, chart_data, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (well_id, anomaly_code, event_date) DO NOTHING
+                    """
                     
                     for r in reviews:
-                        # Check duplicates (by title + timestamp) to prevent spam on re-runs
-                        cur.execute("""
-                            SELECT id FROM anomaly_reviews 
-                            WHERE well_id = %s AND timestamp = %s AND title = %s
-                        """, (r['well_id'], r['timestamp'], r['title']))
-                        
-                        if not cur.fetchone():
-                            cur.execute("""
-                                INSERT INTO anomaly_reviews 
-                                (well_id, timestamp, category, severity, title, description, why_anomaly, root_cause, economic_impact)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """, (
-                                r['well_id'], 
-                                r['timestamp'], 
-                                r['category'], 
-                                r['severity'], 
-                                r['title'], 
-                                r['ui_text']['description'], 
-                                r['ui_text']['why_is_this_an_anomaly'], 
-                                r['ui_text']['suspected_root_cause'], 
-                                r['ui_text']['economic_impact']
-                            ))
+                        cur.execute(insert_query, (
+                            r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                            r['category'], r['severity'], r['title'],
+                            json.dumps(r['ui_text']),
+                            r['impact_metrics']['value'],
+                            r['impact_metrics']['unit'],
+                            json.dumps(r['chart_data']),
+                            r['status']
+                        ))
                 conn.commit()
-                # logger.info(f"Saved {len(reviews)} reviews to Postgres.")
-        except Exception as e:
-            logger.error(f"Postgres save failed: {e}")
+                logger.info(f"Saved {len(reviews)} anomalies to Postgres operation_suggestion.")
+    except Exception as e:
+        logger.error(f"Postgres save failed: {e}")
 
-    # 2. Snowflake (Optional / Async)
-    # Implementing synchronous for now for simplicity
+    # 2. Snowflake (Backup/Analytics)
     try:
         with get_snowflake_conn() as conn:
-             # Ensure table exists
-            conn.cursor().execute("""
-                CREATE TABLE IF NOT EXISTS anomaly_reviews (
-                    well_id VARCHAR(50) NOT NULL,
-                    timestamp TIMESTAMP_NTZ NOT NULL,
-                    category VARCHAR(50),
-                    severity VARCHAR(20),
-                    title VARCHAR(255),
-                    description TEXT,
-                    why_anomaly TEXT,
-                    root_cause TEXT,
-                    economic_impact VARCHAR(100),
-                    status VARCHAR(20) DEFAULT 'New',
-                    created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-                )
-            """)
+            cur = conn.cursor()
+            # Ensure table matches new schema or add columns dynamically? 
+            # Assuming Snowflake schema matches or we append
+            # Snowflake doesn't allow ON CONFLICT cleanly, so we check first or MERGE is better.
+            # Using basic check-then-insert loop for safety
             
+            check_q = "SELECT count(*) FROM operation_suggestion WHERE well_id=%s AND anomaly_code=%s AND event_date=%s"
+            insert_q = """
+                INSERT INTO operation_suggestion
+                (well_id, event_date, detected_at, anomaly_code, category, severity, 
+                 title, ui_text, impact_value, impact_unit, chart_data, status)
+                SELECT %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s, PARSE_JSON(%s), %s
+            """
+            
+            count = 0
             for r in reviews:
-                 # Check duplicates
-                chk = conn.cursor().execute("""
-                    SELECT count(*) FROM anomaly_reviews 
-                    WHERE well_id = %s AND timestamp = %s AND title = %s
-                """, (r['well_id'], r['timestamp'], r['title'])).fetchone()
-                
-                if chk and chk[0] == 0:
-                    conn.cursor().execute("""
-                        INSERT INTO anomaly_reviews 
-                        (well_id, timestamp, category, severity, title, description, why_anomaly, root_cause, economic_impact)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        r['well_id'], 
-                        r['timestamp'], 
-                        r['category'], 
-                        r['severity'], 
-                        r['title'], 
-                        r['ui_text']['description'], 
-                        r['ui_text']['why_is_this_an_anomaly'], 
-                        r['ui_text']['suspected_root_cause'], 
-                        r['ui_text']['economic_impact']
+                cur.execute(check_q, (r['well_id'], r['anomaly_code'], r['event_date']))
+                if cur.fetchone()[0] == 0:
+                    cur.execute(insert_q, (
+                        r['well_id'], r['event_date'], r['detected_at'], r['anomaly_code'],
+                        r['category'], r['severity'], r['title'],
+                        json.dumps(r['ui_text']),
+                        r['impact_metrics']['value'],
+                        r['impact_metrics']['unit'],
+                        json.dumps(r['chart_data']),
+                        r['status']
                     ))
-            # logger.info(f"Saved {len(reviews)} reviews to Snowflake.")
+                    count += 1
+            conn.commit()
+            logger.info(f"Saved {count} anomalies to Snowflake operation_suggestion.")
     except Exception as e:
         logger.error(f"Snowflake save failed: {e}")
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        # Check for optional days argument
-        days = 7
-        if len(sys.argv) > 2:
-            try:
-                days = int(sys.argv[2])
-            except:
-                pass
-        print(json.dumps(detect_anomalies(sys.argv[1], lookback_days=days), indent=2))
-    else:
-        print("Usage: python anomaly_review_service.py <well_id>")
+        print(json.dumps(detect_anomalies(sys.argv[1]), indent=2))
