@@ -39,15 +39,16 @@ except ImportError:
     torch = None
     nn = None
 
+from anomaly_config import (
+    ANOMALY_THRESHOLD, 
+    ML_ONLY_ANOMALY_THRESHOLD,
+    WEIGHTS, 
+    ROLLING_WINDOWS,
+    WELL_TYPE_FEATURES
+)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Configuration
-ROLLING_WINDOWS = [1, 3, 6, 12]  # Hours
-ANOMALY_THRESHOLD = 0.75
-WEIGHTS = {'rules': 0.4, 'iso': 0.3, 'lstm': 0.3}
-# Minimum ML-only score required to flag an anomaly when no rule violations exist
-ML_ONLY_ANOMALY_THRESHOLD = 0.85
 
 # Fallback for when PyTorch is not available
 class FakeLSTMModule:
@@ -338,12 +339,7 @@ class AnomalyDetector:
     
     def _get_features_for_well_type(self, lift_type: str) -> List[str]:
         """Get feature list for the well type."""
-        well_type_features = {
-            'Rod Pump': ['strokes_per_minute', 'torque', 'polish_rod_load', 'pump_fillage', 'tubing_pressure'],
-            'ESP': ['motor_temp', 'motor_current', 'discharge_pressure', 'pump_intake_pressure', 'motor_voltage'],
-            'Gas Lift': ['injection_rate', 'injection_temperature', 'bottomhole_pressure', 'injection_pressure', 'cycle_time']
-        }
-        return well_type_features.get(lift_type, [])
+        return WELL_TYPE_FEATURES.get(lift_type, [])
     
     
     def train_isolation_forest(self, data: np.ndarray) -> Optional[IsolationForest]:

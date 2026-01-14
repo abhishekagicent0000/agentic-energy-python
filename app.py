@@ -146,6 +146,144 @@ def get_db_connection():
         logging.error(f"Failed to connect to Snowflake: {e}")
         raise
 
+def get_historical_anomalies(limit=100, filter_clauses=None, filter_params=None):
+    """
+    Fetch global anomalies from Snowflake with optional filtering.
+    
+    Args:
+        limit (int): Max rows to fetch.
+        filter_clauses (list): List of SQL WHERE fragments (e.g., "TRY_PARSE_JSON(raw_values):X > Y").
+        filter_params (list): List of parameters for the SQL fragments. 
+    """
+    try:
+        conn = get_db_connection()
+        
+        # Base query
+        query = """
+        SELECT 
+            well_id, 
+            timestamp, 
+            category, 
+            severity, 
+            raw_values, 
+            anomaly_score, 
+            anomaly_type as violation_summary 
+        FROM well_anomalies
+        """
+        
+        # Add dynamic filters
+        params = []
+        if filter_clauses:
+            query += " WHERE " + " OR ".join(filter_clauses)
+            if filter_params:
+                params.extend(filter_params)
+        
+        query += " ORDER BY timestamp DESC LIMIT %s"
+        params.append(limit)
+        
+        df = pd.read_sql(query, conn, params=params)
+        df.columns = [c.lower() for c in df.columns]
+        conn.close()
+        return df
+    except Exception as e:
+        logging.warning(f"Could not fetch historical anomalies: {e}")
+        return pd.DataFrame()
+
+def find_similar_anomalies(current_readings, current_violations, historical_df, lift_type=None, similarity_threshold=0.8):
+    """
+    Find historical anomalies similar to the current one based on sensor values.
+    
+    Args:
+        current_readings (dict): Current sensor readings.
+        current_violations (list): List of dicts with 'field' and 'value' for current violations.
+        historical_df (pd.DataFrame): DataFrame of historical anomalies.
+        lift_type (str): Optional lift type (currently not used for filtering df, assuming caller handles context).
+        similarity_threshold (float): Minimum similarity (0-1) to consider a match.
+        
+    Returns:
+        list: Top 3 similar historical records.
+    """
+    if historical_df.empty or not current_violations:
+        return []
+
+    similar_records = []
+    
+    # Identify keys that are actually violated right now
+    violated_keys = [v['field'] for v in current_violations if 'field' in v]
+    
+    for _, row in historical_df.iterrows():
+        try:
+            hist_values = row['raw_values']
+            if isinstance(hist_values, str):
+                hist_values = json.loads(hist_values)
+            elif not isinstance(hist_values, dict):
+                continue
+                
+            # IMPLICIT LIFT TYPE FILTERING:
+            # If the historical record has NONE of the keys in the current violation,
+            # it's likely from a different lift type (e.g. Rod Pump vs ESP).
+            # We skip such records to avoid comparing apples to oranges.
+            # Skip self-match logic moved to insert_reading() where we filter by timestamp.
+            # We must NOT filter by values here, as identical values at DIFFERENT times are valid history.
+            
+            common_keys = set(hist_values.keys()) & set(current_readings.keys())
+            if not common_keys:
+                 continue 
+
+            # Calculate match score
+            matches = 0
+            total_score = 0
+            
+            for key in violated_keys:
+                if key in hist_values and hist_values[key] is not None and current_readings.get(key) is not None:
+                    curr_val = float(current_readings[key])
+                    # Handle historical value which might be a string in JSON
+                    hist_val = float(hist_values[key])
+                    
+                    # Avoid division by zero
+                    max_val = max(abs(curr_val), abs(hist_val))
+                    if max_val == 0:
+                        similarity = 1.0
+                    else:
+                        similarity = 1.0 - (abs(curr_val - hist_val) / max_val)
+                    
+                    if similarity >= similarity_threshold:
+                        matches += 1
+                        total_score += similarity
+            
+            if matches > 0:
+                # Average similarity across matched items
+                avg_similarity = total_score / matches
+                
+                # Calculate deviation and score
+            if matches > 0:
+                # Average similarity across matched items
+                avg_similarity = total_score / matches
+                
+                # Create a record structure compatible with prompt generation
+                record = {
+                    "well_id": row.get('well_id', 'Unknown'),
+                    "timestamp": row['timestamp'],
+                    "alert_title": row['violation_summary'],
+                    "severity": row['severity'],
+                    "similarity_score": avg_similarity,
+                    "match_count": matches,
+                    "raw_anomaly_data": {
+                        "violations": [{"field": k, "value": hist_values.get(k), "violation": str(hist_values.get(k))} for k in violated_keys],
+                        "full_readings": hist_values  # Include full readings for context
+                    }
+                }
+                similar_records.append(record)
+                
+        except Exception as e:
+            # logging.debug(f"Skipping history row due to parse error: {e}")
+            continue
+            
+    # Sort by match count (desc), then similarity score (desc)
+    similar_records.sort(key=lambda x: (x['match_count'], x['similarity_score']), reverse=True)
+    
+    return similar_records[:3]
+
 def init_postgres():
     """Initialize PostgreSQL with operation_suggestion table."""
     success = create_operation_suggestion_table()
@@ -282,13 +420,15 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
                     "date": str(anom.get('timestamp')),   
                     "issue": anom.get('alert_title'),
                     "severity": anom.get('severity'),
-                    "violations": past_violations_list  # Sending the array of {field, violation}
+                    "violations": past_violations_list,  # Sending the array of {field, violation}
+                    "readings": raw_data.get('full_readings', {}), # Include full readings
                 })
         
         # Always dump as JSON string
         history_context_str = json.dumps(formatted_history, indent=2, cls=CustomJSONEncoder, default=str)
-
-            # Calculate severity once to pass to prompt
+    
+        # calculated_severity is already computed in insert_reading or needs to be computed here if this function called standalone
+        # We can re-calculate just to be safe as it's cheap
         calculated_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
  
         # Instruct the model to use the units provided in each violation and not to convert units.
@@ -330,25 +470,26 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
         - LOW: <10% deviation, 0 violations, or score < 0.20
         
         CONFIDENCE CALCULATION:
-        Calculate confidence as a percentage based on the anomaly score:
-        - If anomaly_score >= 0.8: 90-99%
-        - If anomaly_score >= 0.6: 70-85%
-        - If anomaly_score >= 0.4: 50-70%
-        - If anomaly_score >= 0.2: 30-50%
-        - If anomaly_score < 0.2: 10-30%
+        Calculate confidence as a SINGLE percentage value based on the anomaly score.
+        Do NOT return a range. Pick a specific number within the bucket.
+        - If anomaly_score >= 0.8: Return a value between 90% and 99% 
+        - If anomaly_score >= 0.6: Return a value between 70% and 85% 
+        - If anomaly_score >= 0.4: Return a value between 50% and 70% 
+        - If anomaly_score >= 0.2: Return a value between 30% and 50% 
+        - If anomaly_score < 0.2: Return a value between 10% and 30% 
         
         PRE-CLASSIFIED SEVERITY: {calculated_severity}
         ANOMALY SCORE: {anomaly_details.get('anomaly_score', 0):.2f}
         Strictly assign severity level that matches or stays close to this pre-classification.
 
         Important:
-        1. If 'Real Database History' above is not an empty list, you MUST strictly copy that data into 'similar_incidents'.
+        1. If 'Real Database History' above is not an empty list, populate 'similar_incidents' using that data, ensuring you transform the 'readings' into the 'readings_summary' format requested below.
         
         Required JSON Structure:
         1. "alert_title": Short title (e.g., "ESP Motor Current Spike").
         2. "severity": Assign based on severity matrix above (CRITICAL, HIGH, MEDIUM, or LOW).
         3. "status": "ACTIVE".
-        4. "confidence": IMPORTANT - Percentage string (e.g., "65%") calculated from anomaly score. MUST be between 10% and 99%. DO NOT always return 100%. Use the confidence calculation guide above.
+        4. "confidence": IMPORTANT - Single Percentage string (e.g., "78%") calculated from anomaly score. MUST be a single number. DO NOT return a range.
         5. "description": Write a concise, technical paragraph. Within this paragraph, you MUST clearly describe each parameter from 'Violations Detected' that is out of range.
             For each parameter, state the nature of the anomaly by including its observed value and the expected range, both with their units.
             For example: "The motor temperature reached 265 [unit], exceeding the expected operational range of 100–250 [unit]." Use the 'unit' field from each violation object.
@@ -358,9 +499,10 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
             - "asset_history": Object with keys "commissioned" (date), "operating_hours" (int), "last_inspection" (date). Since this data is not provided, you MUST use the string "Data Not Available" for each value.
             - "similar_incidents": A list of objects based ONLY on the 'Real Database History' provided above. If the history is empty, this MUST be an empty list []. For each incident in the history, create an object with the following keys:
                 - "well": Use the "well" value from the history.
-                - "date": Use the "date" value from the history.
-                - "issue": Use the "issue" value from the history.
-                - "violations": Use the "violations" array from history (containing "field" and "violation").
+                - "date": Use the "date" value from the history, use format "MM/DD/YYYY".
+                - "issue": Summarize the technical issue briefly (e.g., "Motor Current High" or "Pressure Violation"). Do NOT copy long "Out of range" error strings.
+                - "severity": Use the "severity" value from the history.
+                 - "violations": Use the "violations" array from history (containing "field" and "violation" ,violation must be in simple value example 300 A).
             - "key_learnings": String field (NOT inside similar_incidents). Analyze the 'Real Database History' provided. If similar incidents exist, identify patterns in frequency, severity, or affected parameters (e.g., "Three pressure-related incidents occurred within 24 hours, suggesting potential equipment degradation")".
        
         9. "risk_analysis": Object containing:
@@ -464,6 +606,9 @@ def insert_reading():
         # Use unified detector with optional lift_type awareness
         anomaly_details = check_anomaly(readings, well_id=well_id, lift_type=lift_type)
 
+        # Calculate severity once to pass to prompt AND to database
+        calculated_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
+        
         # Safety post-check: if there are no rule violations and the anomaly_score
         # is below the ML-only threshold, treat as non-anomalous to avoid false positives.
         try:
@@ -533,13 +678,15 @@ def insert_reading():
                     float(anomaly_details['anomaly_score']),  # Convert numpy float to Python float
                     raw_values,
                     'Rule_Based_Frontend',
-                    'New'
+                    'New',
+                    calculated_severity,
+                    lift_type # Use lift_type as category
                 )
                 cursor.execute(
                     """
                     INSERT INTO well_anomalies
-                    (well_id, timestamp, anomaly_type, anomaly_score, raw_values, model_name, status)
-                    SELECT %s, %s, %s, %s, TRY_PARSE_JSON(%s), %s, %s
+                    (well_id, timestamp, anomaly_type, anomaly_score, raw_values, model_name, status, severity, category)
+                    SELECT %s, %s, %s, %s, TRY_PARSE_JSON(%s), %s, %s, %s, %s
                     """,
                     anomaly_params
                 )
@@ -549,78 +696,72 @@ def insert_reading():
 
             ### START: SIMILARITY SEARCH INTEGRATION ###
             
-            # 3. Intelligent Context Retrieval (Similarity Search Method)
+            # 3. Intelligent Context Retrieval (Similarity Search Method) - PYTHON IMPLEMENTATION
             recent_anomalies_for_prompt = []
-            pg_conn_hist = get_pg_connection()
-            if pg_conn_hist:
-                try:
-                    with pg_conn_hist.cursor(cursor_factory=RealDictCursor) as cur:
-                        # This query calculates a similarity score for past anomalies based on sensor value distance.
-                        # LOGIC UPDATE: Uses 1000 default distance to effectively ignore empty/null history records.
-                        similarity_query = """
-                        WITH current_anomaly_readings AS (
-                            SELECT
-                                %(motor_temp)s::float AS motor_temp,
-                                %(motor_current)s::float AS motor_current,
-                                %(surface_pressure)s::float AS surface_pressure,
-                                %(tubing_pressure)s::float AS tubing_pressure
-                        ),
-                        normalized_distances AS (
-                            SELECT
-                                id,
-                                well_id,
-                                alert_title,
-                                severity,
-                                timestamp,
-                                raw_anomaly_data, 
-                                COALESCE(ABS((raw_anomaly_data -> 'violations' -> 0 ->> 'value')::float - (SELECT motor_temp FROM current_anomaly_readings)) / 150.0, 1000) AS dist_motor_temp,
-                                COALESCE(ABS((raw_anomaly_data -> 'violations' -> 1 ->> 'value')::float - (SELECT motor_current FROM current_anomaly_readings)) / 140.0, 1000) AS dist_motor_current,
-                                COALESCE(ABS((raw_anomaly_data -> 'violations' -> 2 ->> 'value')::float - (SELECT surface_pressure FROM current_anomaly_readings)) / 300.0, 1000) AS dist_surface_pressure,
-                                COALESCE(ABS((raw_anomaly_data -> 'violations' -> 3 ->> 'value')::float - (SELECT tubing_pressure FROM current_anomaly_readings)) / 400.0, 1000) AS dist_tubing_pressure
-                            FROM
-                                anomaly_suggestions
-                            WHERE
-                                timestamp < %(current_timestamp)s
-                                AND raw_anomaly_data IS NOT NULL
-                                AND jsonb_typeof(raw_anomaly_data -> 'violations') = 'array'
-                                AND jsonb_array_length(raw_anomaly_data -> 'violations') > 0
-                        )
-                        SELECT
-                            id,
-                            well_id,
-                            alert_title,
-                            severity,
-                            timestamp,
-                            raw_anomaly_data,
-                            (dist_motor_temp + dist_motor_current + dist_surface_pressure + dist_tubing_pressure) AS total_distance
-                        FROM
-                            normalized_distances
-                        ORDER BY
-                            total_distance ASC
-                        LIMIT 3;
-                        """
-
-                        query_params = {
-                            "motor_temp": readings.get('motor_temp'),
-                            "motor_current": readings.get('motor_current'),
-                            "surface_pressure": readings.get('surface_pressure'),
-                            "tubing_pressure": readings.get('tubing_pressure'),
-                            "current_timestamp": timestamp_str
-                        }
-
-                        cur.execute(similarity_query, query_params)
-                        recent_anomalies_for_prompt = cur.fetchall()
-
-                        if recent_anomalies_for_prompt:
-                            logging.info(f"✓ Found {len(recent_anomalies_for_prompt)} similar historical anomalies for well {well_id} using similarity search.")
-                        else:
-                            logging.info(f"No similar historical anomalies found for well {well_id} using similarity search.")
+            try:
+                # OPTIMIZATION: Construct dynamic SQL filters to push 80% similarity check to Snowflake
+                # This prevents fetching 2000+ rows and only fetches highly relevant candidates.
+                filter_clauses = []
+                filter_params = []
+                
+                for v in anomaly_details.get('violations', []):
+                    field = v.get('field')
+                    val = readings.get(field)
+                    # Ensure we have a valid numeric value to build a range
+                    if field and val is not None and isinstance(val, (int, float)):
+                        # 80% similarity window = +/- 20%
+                        # Range: [val * 0.8, val * 1.2]
+                        lower = float(val) * 0.8
+                        upper = float(val) * 1.2
                         
-                except Exception as e:
-                    logging.error(f"Could not fetch similarity-based historical anomalies for prompt: {e}")
-                finally:
-                    if pg_conn_hist:
-                        pg_conn_hist.close()
+                        # Snowflake SQL: Check if the JSON field is within range
+                        # Note: We use TRY_PARSE_JSON just in case, though raw_values is likely variant/json
+                        filter_clauses.append(f"(CAST(TRY_PARSE_JSON(raw_values):{field} AS FLOAT) BETWEEN %s AND %s)")
+                        filter_params.extend([lower, upper])
+
+                # Fetch global historical anomalies with filters (limit 100 is now sufficient due to filtering)
+                
+                # Fetch global historical anomalies with filters (limit 100 is now sufficient due to filtering)
+                hist_anomalies_df = get_historical_anomalies(
+                    limit=100, 
+                    filter_clauses=filter_clauses, 
+                    filter_params=filter_params
+                )
+
+                # --- FIX: Filter out the CURRENT anomaly we just inserted ---
+                # The 'hist_anomalies_df' will contain the record from step 2 above.
+                # We simply drop rows that match this well_id AND this specific timestamp.
+                if not hist_anomalies_df.empty:
+                    # Ensure timestamp column is datetime
+                    hist_anomalies_df['timestamp'] = pd.to_datetime(hist_anomalies_df['timestamp'])
+                    current_ts = pd.to_datetime(timestamp_str)
+                    
+                    # Filter: Keep rows where (well_id != current_well) OR (timestamp != current_ts)
+                    # Note: Timestamp from DB might have slight microsecond diffs vs string, so we allow tiny buffer or exact string match if possible.
+                    # Best approach: exclude if well_id matches AND abs(time_diff) < 1 second
+                    
+                    mask = (hist_anomalies_df['well_id'] == well_id) & \
+                           ((hist_anomalies_df['timestamp'] - current_ts).abs() < pd.Timedelta(seconds=1))
+                    
+                    hist_anomalies_df = hist_anomalies_df[~mask]
+
+                
+                # Perform final precise ranking in-memory
+                recent_anomalies_for_prompt = find_similar_anomalies(
+                    current_readings=readings,
+                    current_violations=anomaly_details.get('violations', []),
+                    historical_df=hist_anomalies_df,
+                    lift_type=lift_type,
+                    similarity_threshold=0.8
+                )
+                
+                if recent_anomalies_for_prompt:
+                    logging.info(f"✓ Found {len(recent_anomalies_for_prompt)} similar historical anomalies (optimized cross-well) using Snowflake push-down.")
+                else:
+                    logging.info(f"No similar historical anomalies found for well {well_id} using Python similarity search.")
+                    
+            except Exception as e:
+                logging.error(f"Could not fetch similarity-based historical anomalies: {e}")
             
             ### END: SIMILARITY SEARCH INTEGRATION ###
 
