@@ -43,30 +43,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+from anomaly_config import (
+    WELL_TYPES,
+    WELL_TYPE_FEATURES,
+    CONTAMINATION_RATIO
+)
+
 # ===== CONFIGURATION =====
 MODELS_DIR = 'models'
 TRAINING_DATA_FILE = 'training_data.csv'
-
-WELL_TYPES = ['Rod Pump', 'ESP', 'Gas Lift']
-
-# Well-type specific feature columns
-WELL_TYPE_FEATURES = {
-    'Rod Pump': [
-        'strokes_per_minute', 'torque', 'polish_rod_load', 
-        'pump_fillage', 'tubing_pressure'
-    ],
-    'ESP': [
-        'motor_temp', 'motor_current', 'discharge_pressure',
-        'pump_intake_pressure', 'motor_voltage'
-    ],
-    'Gas Lift': [
-        'injection_rate', 'injection_temperature', 'bottomhole_pressure',
-        'injection_pressure', 'cycle_time'
-    ]
-}
-
-# Anomaly thresholds (contamination factor for Isolation Forest)
-CONTAMINATION_RATIO = 0.1  # Assume ~10% of data might be anomalies
 
 # Snowflake config
 SNOWFLAKE_CONFIG = {

@@ -422,17 +422,7 @@
               </div>
             </div>
 
-            <div class="form-row">
-              <div class="form-group">
-                <label for="timestamp">Timestamp *</label>
-                <input
-                  type="datetime-local"
-                  id="timestamp"
-                  name="timestamp"
-                  required
-                />
-              </div>
-            </div>
+            <!-- Timestamp removed (Dynamic) -->
 
             <!-- Rod Pump Fields -->
             <div id="rodPumpFields" style="display: none">
@@ -743,12 +733,7 @@
     </div>
 
     <script>
-      // Set current timestamp as default
-      const now = new Date();
-      now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
-      document.getElementById("timestamp").value = now
-        .toISOString()
-        .slice(0, 16);
+      // Timestamp default logic removed (Dynamic on submit)
 
       // Dynamic field ranges and visibility based on lift type
       const liftTypeFields = {
@@ -845,10 +830,15 @@
           loading.style.display = "block";
 
           // Build form data based on selected well type
+          // Dynamic Timestamp: Current Local Time
+          const now = new Date();
+          now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+          const dynamicTimestamp = now.toISOString().slice(0, 16);
+
           const liftType = document.getElementById("liftType").value;
           const formData = {
             well_id: document.getElementById("wellId").value,
-            timestamp: document.getElementById("timestamp").value,
+            timestamp: dynamicTimestamp,
             lift_type: liftType,
           };
 
@@ -938,11 +928,7 @@
               resultDiv.classList.add("show");
 
               document.getElementById("sensorForm").reset();
-              const now = new Date();
-              now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
-              document.getElementById("timestamp").value = now
-                .toISOString()
-                .slice(0, 16);
+              document.getElementById("sensorForm").reset();
             } else {
               errorDiv.textContent = data.error || "System error";
               errorDiv.style.display = "block";
