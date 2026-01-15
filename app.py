@@ -8,8 +8,9 @@ import os
 from uuid import uuid4
 import random
 import openai
+import re
 
-# Custom JSON Encoder to handle non-serializable types
+# Custom JSON Encoder
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (bool, np.bool_)):
@@ -27,9 +28,7 @@ class CustomJSONEncoder(json.JSONEncoder):
         else:
             return super().default(obj)
 
-# Helper function to convert non-JSON-serializable types
 def convert_to_serializable(obj):
-    """Convert non-JSON-serializable objects (like bool, numpy types) to JSON-serializable format."""
     if isinstance(obj, dict):
         return {k: convert_to_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, (list, tuple)):
@@ -55,7 +54,6 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Import database operations from operation.py
 from operation import (
     create_operation_suggestion_table,
     save_operation_suggestion,
@@ -65,21 +63,18 @@ from operation import (
     get_pg_connection
 )
 
-# Try to import operational recommendations, handle if missing
 try:
     from operational_recommendations import generate_recommendations_for_well
 except ImportError:
     generate_recommendations_for_well = None
 
-# Import unified anomaly detector (replaces hardcoded RULES)
 try:
     from anomaly_detector import get_detector, check_anomaly as detector_check_anomaly
     ANOMALY_DETECTOR_AVAILABLE = True
 except ImportError:
     ANOMALY_DETECTOR_AVAILABLE = False
-    logging.warning("anomaly_detector module not available; falling back to hardcoded rules")
+    logging.warning("anomaly_detector module not available")
 
-# Import dynamic configuration
 try:
     from dynamic_config import get_lift_types, get_form_sensors, get_sensor_ranges, get_form_fields
     DYNAMIC_CONFIG_AVAILABLE = True
@@ -94,12 +89,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 APP_URL = os.getenv("APP_URL", "http://localhost:5000")
 
-# OpenAI Config
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     logging.error("OPENAI_API_KEY is missing in .env")
-else:
-    logging.info(f"OPENAI_API_KEY loaded: {api_key[:8]}...{api_key[-4:]}")
 
 client = openai.OpenAI(
     api_key=api_key,
@@ -111,7 +103,6 @@ client = openai.OpenAI(
 )
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# Snowflake Config
 SNOWFLAKE_CONFIG = {
     'user': os.getenv('SNOWFLAKE_USER'),
     'password': os.getenv('SNOWFLAKE_PASSWORD'),
@@ -127,19 +118,13 @@ missing_sf = [k for k in REQUIRED_SNOWFLAKE_KEYS if not SNOWFLAKE_CONFIG.get(k)]
 if missing_sf:
     logging.warning(f"Missing Snowflake configuration keys: {missing_sf}")
 
-# Initialize anomaly detector (loads rules from Snowflake dynamic config)
 if ANOMALY_DETECTOR_AVAILABLE:
     anomaly_detector = get_detector()
-    logging.info("✓ Unified anomaly detector initialized with dynamic Snowflake config")
+    logging.info("✓ Unified anomaly detector initialized")
 else:
-    raise RuntimeError("Anomaly detector unavailable; dynamic Snowflake config required")
-
-# --- Database Connections ---
+    raise RuntimeError("Anomaly detector unavailable")
 
 def get_db_connection():
-    missing = [k for k in REQUIRED_SNOWFLAKE_KEYS if not SNOWFLAKE_CONFIG.get(k)]
-    if missing:
-        raise ValueError(f"Missing Snowflake configuration: {missing}")
     try:
         conn = snowflake_connect(**SNOWFLAKE_CONFIG)
         return conn
@@ -147,19 +132,9 @@ def get_db_connection():
         logging.error(f"Failed to connect to Snowflake: {e}")
         raise
 
-def get_historical_anomalies(limit=200, filter_clauses=None, filter_params=None):
-    """
-    Fetch global anomalies from Snowflake with optional filtering.
-    
-    Args:
-        limit (int): Max rows to fetch.
-        filter_clauses (list): List of SQL WHERE fragments (DEPRECATED - not used).
-        filter_params (list): List of parameters for SQL fragments (DEPRECATED - not used).
-    """
+def get_historical_anomalies(limit=200):
     try:
         conn = get_db_connection()
-        
-        # Base query - NO FILTERING
         query = """
         SELECT 
             well_id, 
@@ -173,186 +148,210 @@ def get_historical_anomalies(limit=200, filter_clauses=None, filter_params=None)
         ORDER BY timestamp DESC 
         LIMIT %s
         """
-        
-        params = [limit]
-        
         cursor = conn.cursor()
         try:
-            cursor.execute(query, params)
+            cursor.execute(query, [limit])
             rows = cursor.fetchall()
             cols = [c[0].lower() for c in cursor.description] if cursor.description else []
             df = pd.DataFrame(rows, columns=cols)
         finally:
             cursor.close()
+            conn.close()
         return df
     except Exception as e:
         logging.warning(f"Could not fetch historical anomalies: {e}")
         return pd.DataFrame()
 
-def find_similar_anomalies(current_readings, current_violations, historical_df, current_well_id, lift_type=None, similarity_threshold=0.8, max_deviation_percent=20.0):
+def find_similar_anomalies(current_readings, current_violations, historical_df=None, current_well_id=None, lift_type=None, similarity_threshold=None, max_deviation_percent=20.0, exclude_anomaly_id=None):
     """
-    Find historical anomalies similar to the current one with STRICT deviation limit.
+    Find similar anomalies using a Split Strategy.
     
-    CRITICAL: This function enforces max_deviation_percent (default 20%) across ALL fields.
-    Every violated field must be within ±20% of the current value.
+    1. Pass 1 (Same Well): Relaxed Match.
+    2. Pass 2 (Diff Well): Strict Match.
     
-    Logic:
-    1. Re-evaluate historical record using CURRENT check_anomaly
-    2. Different Wells: STRICT match (Identical violated fields)
-    3. Same Well: RELAXED match (At least one common violated field)
-    4. **ENFORCED**: ALL common fields must be within max_deviation_percent
-    
-    Args:
-        current_readings (dict): Current sensor readings
-        current_violations (list): List of current violations
-        historical_df (pd.DataFrame): Historical anomaly data
-        current_well_id (str): Current well ID
-        lift_type (str): Lift type for re-evaluation
-        similarity_threshold (float): Legacy parameter, not used for filtering
-        max_deviation_percent (float): Maximum allowed deviation (20 = ±20% from current)
-        
-    Returns:
-        list: Top 3 similar historical records, sorted by closest match
+    SORTING PRIORITY:
+    1. Latest Timestamp (Newest first) - Enforced by SQL Order.
+    2. (Implicitly) Similarity is secondary to recency.
     """
-    if historical_df.empty or not current_violations:
+    if not current_violations:
         return []
 
-    similar_records = []
-    current_violated_keys = set(v['field'] for v in current_violations if 'field' in v)
-    if not current_violated_keys:
-        return []
-
-    for _, row in historical_df.iterrows():
-        try:
-            # 1. Parse raw values from history
-            hist_values = row['raw_values']
-            if isinstance(hist_values, str):
-                try:
-                    hist_values = json.loads(hist_values)
-                except:
-                    continue
-            elif not isinstance(hist_values, dict):
+    violation_criteria = []
+    current_violation_keys = set()
+    
+    for v in current_violations:
+        field = v.get('field')
+        val = v.get('value')
+        if field and val is not None:
+            current_violation_keys.add(field)
+            try:
+                val_float = float(val)
+                pct = max_deviation_percent / 100.0
+                min_bound = val_float * (1.0 - pct)
+                max_bound = val_float * (1.0 + pct)
+                violation_criteria.append({
+                    'field': field,
+                    'min': min(min_bound, max_bound),
+                    'max': max(min_bound, max_bound)
+                })
+            except:
                 continue
-                
-            # 2. Re-evaluate historical record with current rules
-            re_eval_well_id = row.get('well_id', 'Unknown')
-            re_eval_result = check_anomaly(hist_values, well_id=re_eval_well_id, lift_type=lift_type)
-            hist_violations_list = re_eval_result.get('violations', [])
-            hist_violated_keys = set(v['field'] for v in hist_violations_list if 'field' in v)
+
+    if not violation_criteria:
+        return []
+
+    conn = get_db_connection()
+
+    # --- INTERNAL HELPER ---
+    def fetch_candidates(is_same_well):
+        cursor = conn.cursor()
+        try:
+            where_clauses = []
+            params = []
             
-            # 3. Apply Matching Logic
-            is_same_well = (re_eval_well_id == current_well_id)
-            match_found = False
+            for c in violation_criteria:
+                where_clauses.append("(v2.parameter_name = %s AND v2.actual_value BETWEEN %s AND %s)")
+                params.extend([c['field'], c['min'], c['max']])
+            
+            where_range_sql = " OR ".join(where_clauses)
             
             if is_same_well:
-                # Relaxed: At least one common violation
-                if current_violated_keys.intersection(hist_violated_keys):
-                    match_found = True
+                well_logic_sql = "a2.well_id = %s"
             else:
-                # Strict: Exact set equality required
-                if current_violated_keys == hist_violated_keys and len(current_violated_keys) > 0:
-                    match_found = True
-            
-            if not match_found:
-                continue
-                
-            # 4. CRITICAL: STRICT 20% DEVIATION CHECK
-            common_keys = current_violated_keys.intersection(hist_violated_keys)
-            
-            # Check if ALL common fields are within max_deviation_percent
-            all_within_tolerance = True
-            field_stats = {}
-            
-            # Safe float conversion
-            def safe_float(val):
-                if val is None: return 0.0
-                try: return float(val)
-                except: return 0.0
+                well_logic_sql = "a2.well_id != %s"
+            params.append(current_well_id)
 
-            for key in common_keys:
-                curr_val = safe_float(current_readings.get(key))
-                hist_val = safe_float(hist_values.get(key))
+            if exclude_anomaly_id is not None:
+                well_logic_sql += " AND a2.ID != %s"
+                params.append(exclude_anomaly_id)
+
+            # Order by Time DESC from DB = Priority #1
+            query = f"""
+            SELECT
+                a.well_id,
+                a.timestamp,
+                a.anomaly_type,
+                a.severity,
+                a.raw_values,
+                v.parameter_name,
+                v.actual_value,
+                v.deviation_percent,
+                v.unit
+            FROM anomaly_violations_new v
+            JOIN well_anomalies a ON v.anomaly_id = a.ID
+            WHERE a.ID IN (
+                SELECT DISTINCT a2.ID
+                FROM anomaly_violations_new v2
+                JOIN well_anomalies a2 ON v2.anomaly_id = a2.ID
+                WHERE ({where_range_sql})
+                AND {well_logic_sql}
+            )
+            ORDER BY a.timestamp DESC
+            LIMIT 50
+            """
+            
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            
+            grouped = {}
+            for r in rows:
+                key = f"{r[0]}_{str(r[1])}"
+                if key not in grouped:
+                    raw_val_str = r[4]
+                    try: full_readings = json.loads(raw_val_str) if raw_val_str else {}
+                    except: full_readings = {}
+
+                    grouped[key] = {
+                        "well_id": r[0],
+                        "timestamp": r[1],
+                        "alert_title": r[2],
+                        "severity": r[3],
+                        "raw_anomaly_data": {
+                            "full_readings": full_readings,
+                            "violations": []
+                        }
+                    }
                 
-                # Calculate percentage deviation relative to CURRENT value
-                if curr_val == 0:
-                    # If current is 0, can't calculate % deviation
-                    if hist_val == 0:
-                        deviation_percent = 0.0
-                    else:
-                        # Historical value exists but current is 0 - reject
-                        all_within_tolerance = False
-                        logging.debug(
-                            f"Rejected {re_eval_well_id} - {key}: curr=0 but hist={hist_val}"
-                        )
-                        break
+                unit_str = r[8] if r[8] else ""
+                clean_violation_str = f"{r[6]} {unit_str}".strip()
+
+                grouped[key]["raw_anomaly_data"]["violations"].append({
+                    "field": r[5],
+                    "violation": clean_violation_str,
+                    "raw_value": r[6]
+                })
+            
+            valid_records = []
+            for record in grouped.values():
+                hist_violations = record['raw_anomaly_data']['violations']
+                hist_all_keys = set(hv['field'] for hv in hist_violations)
+                
+                matched_keys_in_this_record = set()
+
+                for hv in hist_violations:
+                    h_field = hv['field']
+                    try:
+                        h_val = float(hv['raw_value'])
+                        for crit in violation_criteria:
+                            if crit['field'] == h_field:
+                                if crit['min'] <= h_val <= crit['max']:
+                                    matched_keys_in_this_record.add(h_field)
+                    except:
+                        continue
+
+                # --- DECISION ---
+                keep = False
+                if is_same_well:
+                    # Same Well: Relaxed (Keep if ANY matched)
+                    if len(matched_keys_in_this_record) > 0:
+                        keep = True
                 else:
-                    # Standard percentage deviation: |hist - curr| / curr * 100
-                    deviation_percent = abs((hist_val - curr_val) / curr_val) * 100.0
+                    # Diff Well: STRICT (Sets must be identical & values close)
+                    sets_are_identical = (hist_all_keys == current_violation_keys)
+                    values_are_close = current_violation_keys.issubset(matched_keys_in_this_record)
+                    if sets_are_identical and values_are_close:
+                        keep = True
                 
-                field_stats[key] = {
-                    'curr_val': curr_val,
-                    'hist_val': hist_val,
-                    'deviation_percent': deviation_percent
-                }
-                
-                # REJECT if ANY field exceeds max_deviation_percent
-                if deviation_percent > max_deviation_percent:
-                    all_within_tolerance = False
-                    logging.debug(
-                        f"Rejected {re_eval_well_id} - {key}: {hist_val} vs {curr_val} "
-                        f"({deviation_percent:.1f}% deviation > {max_deviation_percent}%)"
-                    )
-                    break
+                if keep:
+                    valid_records.append(record)
             
-            if not all_within_tolerance:
-                continue
-            
-            # 5. All fields passed - calculate metrics for ranking
-            avg_deviation = sum(fs['deviation_percent'] for fs in field_stats.values()) / len(field_stats)
-            
-            # Calculate similarity score for display (inverse of deviation)
-            avg_similarity = max(0.0, 1.0 - (avg_deviation / 100.0))
-            
-            record = {
-                "well_id": row.get('well_id', 'Unknown'),
-                "timestamp": row['timestamp'],
-                "alert_title": row['violation_summary'],
-                "severity": row['severity'],
-                "similarity_score": avg_similarity,
-                "match_count": len(common_keys),
-                "avg_deviation_percent": round(avg_deviation, 2),
-                "raw_anomaly_data": {
-                    "violations": hist_violations_list, 
-                    "full_readings": hist_values
-                }
-            }
-            similar_records.append(record)
-                
-        except Exception as e:
-            logging.debug(f"Skipping history row: {e}")
-            continue
-            
-    # Sort by avg_deviation (ASC) - closest matches first
-    similar_records.sort(key=lambda x: x['avg_deviation_percent'])
-    
-    if similar_records:
-        logging.info(f"Found {len(similar_records)} records within {max_deviation_percent}% tolerance")
-    
-    return similar_records[:3]
+            # NO SORTING HERE. We keep the order from SQL (Time DESC).
+            return valid_records
 
+        except Exception as e:
+            logging.error(f"Error in fetch_candidates: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    try:
+        # Pass 1: Same Well (Priority 1)
+        same_well_matches = fetch_candidates(is_same_well=True)
+        
+        # Pass 2: Different Wells (Priority 2)
+        diff_well_matches = fetch_candidates(is_same_well=False)
+        
+        # Merge
+        final_records = same_well_matches + diff_well_matches
+        
+        # Cleanup
+        for r in final_records:
+            for v in r['raw_anomaly_data']['violations']:
+                if 'raw_value' in v: del v['raw_value']
+
+        return final_records[:3]
+
+    except Exception as e:
+        logging.error(f"Top Level Error in Similarity Search: {e}")
+        return []
+    finally:
+        conn.close()
+        
 def init_postgres():
-    """Initialize PostgreSQL with operation_suggestion table."""
     success = create_operation_suggestion_table()
-    if success:
-        logging.info("✓ PostgreSQL initialization complete.")
-    else:
-        logging.error("✗ Error initializing PostgreSQL")
-    
     conn = get_pg_connection()
     if not conn:
-        logging.warning("✗ Could not connect to PostgreSQL for anomaly_suggestions table check.")
         return
-
     try:
         cur = conn.cursor()
         cur.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
@@ -380,19 +379,14 @@ def init_postgres():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            logging.info("✓ PostgreSQL table 'anomaly_suggestions' created.")
         else:
-            logging.info("✓ PostgreSQL table 'anomaly_suggestions' already exists.")
             try:
                 cur.execute("ALTER TABLE anomaly_suggestions ADD COLUMN IF NOT EXISTS asset_id VARCHAR(50);")
                 cur.execute("ALTER TABLE anomaly_suggestions ADD COLUMN IF NOT EXISTS lift_type VARCHAR(50);")
             except Exception:
                 pass
-
         conn.commit()
-        logging.info("✓ PostgreSQL anomaly tables verified.")
     except Exception as e:
-        logging.error(f"✗ Error initializing PostgreSQL: {e}")
         if conn: conn.rollback()
     finally:
         if conn:
@@ -401,97 +395,70 @@ def init_postgres():
 
 init_postgres()
 
-# --- Anomaly Detection with Dynamic Snowflake Config ---
 def check_anomaly(readings, well_id=None, lift_type=None):
-    """
-    Check for anomalies using unified detector with Snowflake dynamic config.
-    
-    Uses dynamic configuration from Snowflake for all rules and sensor definitions.
-    """
     return anomaly_detector.check_anomaly(readings, well_id, lift_type)
 
 def calculate_severity(anomaly_details, anomaly_score, readings):
-    """
-    Calculate severity based on violation count, anomaly score, and deviation percentage.
-    """
     violations = anomaly_details.get('violations', []) or []
     num_violations = len(violations)
-
-    # Calculate average deviation percentage robustly
     deviations = []
     for v in violations:
         try:
             value = v.get('value')
             min_val = v.get('min')
             max_val = v.get('max')
-
             if value is None or min_val is None or max_val is None:
                 continue
-
             fv = float(value)
             fmin = float(min_val)
             fmax = float(max_val)
-
             rng = abs(fmax - fmin) if (fmax - fmin) != 0 else 1.0
             if fv < fmin:
                 deviation = abs(fmin - fv) / rng * 100.0
             else:
                 deviation = abs(fv - fmax) / rng * 100.0
-
             deviations.append(deviation)
         except Exception:
             continue
-
     avg_deviation = float(sum(deviations) / len(deviations)) if deviations else 0.0
     a_score = float(anomaly_score or 0.0)
 
-    # Severity matrix
     if (num_violations >= 3 and (a_score >= 0.85 or avg_deviation > 60)) or a_score >= 0.98:
         return "CRITICAL"
-
     if num_violations == 2:
-        if a_score >= 0.60 or avg_deviation > 40:
-            return "HIGH"
-        if a_score >= 0.35 or avg_deviation > 20:
-            return "MEDIUM"
+        if a_score >= 0.60 or avg_deviation > 40: return "HIGH"
+        if a_score >= 0.35 or avg_deviation > 20: return "MEDIUM"
         return "LOW"
-
     if num_violations == 1:
-        if a_score >= 0.50 or avg_deviation > 25:
-            return "HIGH"
-        if a_score >= 0.35 or avg_deviation > 12:
-            return "MEDIUM"
+        if a_score >= 0.50 or avg_deviation > 25: return "HIGH"
+        if a_score >= 0.35 or avg_deviation > 12: return "MEDIUM"
         return "LOW"
-
-    if a_score >= 0.75:
-        return "HIGH"
-    if a_score >= 0.35:
-        return "MEDIUM"
+    if a_score >= 0.75: return "HIGH"
+    if a_score >= 0.35: return "MEDIUM"
     return "LOW"
 
-# --- AI Logic ---
 def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, historical_anomalies=None, lift_type=None):
     try:
         # Prepare historical context
         formatted_history = []
-        
         if historical_anomalies:
             for anom in historical_anomalies:
                 raw_data = anom.get('raw_anomaly_data')
-                
                 if isinstance(raw_data, str):
                     try:
                         raw_data = json.loads(raw_data)
                     except:
                         raw_data = {}
                 
-                # Extract ALL violations for this incident
                 past_violations_list = []
                 if raw_data and 'violations' in raw_data and isinstance(raw_data['violations'], list):
                     for v in raw_data['violations']:
+                        raw_msg = v.get('violation', '')
+                        # Regex cleaner to remove deviation % or "(Historical)" text before sending to AI
+                        clean_msg = re.sub(r'\s*\(.*?\)', '', raw_msg).strip() 
                         past_violations_list.append({
                             "field": v.get('field'),
-                            "violation": v.get('violation')
+                            "violation": clean_msg 
                         })
 
                 formatted_history.append({
@@ -503,9 +470,10 @@ def generate_suggestion(anomaly_details, well_id, readings, timestamp_str, histo
                     "readings": raw_data.get('full_readings', {}),
                 })
         
+        
         history_context_str = json.dumps(formatted_history, indent=2, cls=CustomJSONEncoder, default=str)
         
-        # Provide guidance when no history found
+        history_guidance = ""
         if not formatted_history:
             history_guidance = """
 NOTE: No similar historical incidents found matching the current anomaly within 20% tolerance.
@@ -516,12 +484,9 @@ This could indicate:
 IMPORTANT: You MUST still provide a 'key_learnings' field stating:
 "No similar historical incidents found."
 """
-        else:
-            history_guidance = ""
     
         calculated_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
  
-        # Get sensor ranges for authoritative reference
         sensor_ranges_str = "{}"
         try:
             if lift_type and DYNAMIC_CONFIG_AVAILABLE:
@@ -530,6 +495,7 @@ IMPORTANT: You MUST still provide a 'key_learnings' field stating:
         except Exception:
             sensor_ranges_str = "{}"
             
+        # RESTORED FULL ORIGINAL PROMPT
         prompt = f"""
         You are an expert Production Engineer AI assistant. Analyze the new anomaly.
         
@@ -594,7 +560,7 @@ IMPORTANT: You MUST still provide a 'key_learnings' field stating:
                 - "date": Use the "date" value from the history, use format "MM/DD/YYYY HH:MM".
                 - "issue": Summarize the technical issue briefly (e.g., "Motor Current High" or "Pressure Violation"). Do NOT copy long "Out of range" error strings.
                 - "severity": Use the "severity" value from the history.
-                - "violations": Use the "violations" array from history (containing "field" and "violation", violation must be in simple value example 300 A).
+                - "violations": Use the "violations" array from history (containing "field" and "violation", violation must be in simple value example 300 A). Do NOT repeat the parameter name or add words like "value" or "Historical" in value.
             - "key_learnings": String field (NOT inside similar_incidents). ALWAYS REQUIRED. 
                 * If similar_incidents is empty, write: "No similar historical incidents found."
                 * If similar_incidents exist, analyze patterns in frequency, severity, or affected parameters (e.g., "Three pressure-related incidents occurred within 24 hours, suggesting potential equipment degradation").
@@ -624,24 +590,20 @@ IMPORTANT: You MUST still provide a 'key_learnings' field stating:
             
         suggestion_data = json.loads(content.strip())
         
-        # Validate and ensure historical_context always has required fields
         if 'historical_context' not in suggestion_data:
             suggestion_data['historical_context'] = {}
         
         hc = suggestion_data['historical_context']
         
-        # Ensure key_learnings always exists
         if 'key_learnings' not in hc or not hc['key_learnings']:
             if not hc.get('similar_incidents'):
                 hc['key_learnings'] = "No similar historical incidents found within 20% tolerance. This appears to be a novel anomaly pattern for this well, requiring careful investigation."
             else:
                 hc['key_learnings'] = "Historical patterns identified - see similar incidents for details."
         
-        # Ensure similar_incidents is always a list
         if 'similar_incidents' not in hc:
             hc['similar_incidents'] = []
         
-        # Ensure asset_history exists
         if 'asset_history' not in hc:
             hc['asset_history'] = {
                 "commissioned": "Data Not Available",
@@ -662,18 +624,12 @@ IMPORTANT: You MUST still provide a 'key_learnings' field stating:
             "suggested_actions": ["Investigate manually"],
             "explanation": f"AI Generation failed: {str(e)}",
             "historical_context": {
-                "asset_history": {
-                    "commissioned": "Data Not Available",
-                    "operating_hours": "Data Not Available",
-                    "last_inspection": "Data Not Available"
-                },
+                "asset_history": {"commissioned": "N/A", "operating_hours": "N/A", "last_inspection": "N/A"},
                 "similar_incidents": [],
-                "key_learnings": "AI generation failed - manual investigation required."
+                "key_learnings": "AI generation failed."
             },
             "risk_analysis": {}
         }
-
-# --- Routes ---
 
 @app.route('/')
 def index():
@@ -681,43 +637,33 @@ def index():
 
 @app.route('/api/form-config', methods=['GET'])
 def get_form_config():
-    """Get dynamic form configuration for all lift types."""
     try:
         if not DYNAMIC_CONFIG_AVAILABLE:
             return jsonify({"error": "Dynamic config not available"}), 503
         
         lift_types = get_lift_types()
         config = {}
-        
         for lift_type_name in lift_types.keys():
-            sensors = get_form_sensors(lift_type_name)
-            ranges = get_sensor_ranges(lift_type_name)
-            
             config[lift_type_name] = {
-                'sensors': sensors,
-                'ranges': ranges
+                'sensors': get_form_sensors(lift_type_name),
+                'ranges': get_sensor_ranges(lift_type_name)
             }
-        
         return jsonify(config), 200
     except Exception as e:
-        logging.error(f"Error fetching form config: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/insert-reading', methods=['POST'])
 def insert_reading():
     try:
         data = request.get_json()
-        required_fields = ['well_id', 'timestamp']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({"error": f"Missing required field: {field}"}), 400
+        if 'well_id' not in data or 'timestamp' not in data:
+            return jsonify({"error": "Missing required field"}), 400
 
         well_id = data.get('well_id')
         timestamp_str = data.get('timestamp')
         lift_type = data.get('lift_type')
         
         readings = {}
-        # Extract fields based on well type
         if lift_type == 'Rod Pump':
             field_list = ['strokes_per_minute', 'torque', 'polish_rod_load', 'pump_fillage', 'tubing_pressure']
         elif lift_type == 'ESP':
@@ -731,13 +677,9 @@ def insert_reading():
             value = data.get(field)
             readings[field] = float(value) if value is not None else None
 
-        # Use unified detector with optional lift_type awareness
         anomaly_details = check_anomaly(readings, well_id=well_id, lift_type=lift_type)
-
-        # Calculate severity once
         calculated_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
         
-        # Safety post-check
         try:
             from anomaly_detector import ML_ONLY_ANOMALY_THRESHOLD
             if (not anomaly_details.get('violations')) and float(anomaly_details.get('anomaly_score', 0)) < ML_ONLY_ANOMALY_THRESHOLD:
@@ -745,68 +687,54 @@ def insert_reading():
         except Exception:
             pass
 
-        # 1. Insert Raw Reading into Snowflake
         conn = get_db_connection()
         cursor = conn.cursor()
+        
         try:
             def convert_for_db(val):
-                if isinstance(val, np.integer):
-                    return int(val)
-                elif isinstance(val, np.floating):
-                    return float(val)
-                elif isinstance(val, np.bool_):
-                    return bool(val)
-                elif isinstance(val, np.ndarray):
-                    return val.tolist()
+                if isinstance(val, (np.integer, int)): return int(val)
+                elif isinstance(val, (np.floating, float)): return float(val)
+                elif isinstance(val, (np.bool_, bool)): return bool(val)
+                elif isinstance(val, np.ndarray): return val.tolist()
                 return val
             
+            # --- 1. INSERT RAW READING ---
             field_names = ['well_id', 'timestamp', 'lift_type'] + list(readings.keys())
             field_values = [well_id, timestamp_str, lift_type] + [convert_for_db(v) for v in readings.values()]
-            
             placeholders = ', '.join(['%s'] * len(field_values))
             fields_str = ', '.join(field_names)
             
-            query = f"INSERT INTO well_sensor_readings ({fields_str}) VALUES ({placeholders})"
+            query_readings = f"INSERT INTO well_sensor_readings ({fields_str}) VALUES ({placeholders})"
             
             try:
-                cursor.execute(query, field_values)
+                cursor.execute(query_readings, field_values)
             except Exception as e:
+                # If lift_type column is missing, retry without it
                 if "lift_type" in str(e).lower() or "invalid identifier" in str(e).lower():
-                    logging.warning(f"⚠ lift_type column not found. Run: python migrate_add_lift_type.py")
                     field_names = ['well_id', 'timestamp'] + list(readings.keys())
                     field_values = [well_id, timestamp_str] + [convert_for_db(v) for v in readings.values()]
                     placeholders = ', '.join(['%s'] * len(field_values))
                     fields_str = ', '.join(field_names)
-                    query = f"INSERT INTO well_sensor_readings ({fields_str}) VALUES ({placeholders})"
-                    cursor.execute(query, field_values)
+                    query_readings = f"INSERT INTO well_sensor_readings ({fields_str}) VALUES ({placeholders})"
+                    cursor.execute(query_readings, field_values)
                 else:
                     raise
+            
             conn.commit()
-        finally:
-            cursor.close()
-        
-        suggestion_result = None
 
-        if anomaly_details['is_anomaly']:
-            # 2. Insert Anomaly Record into Snowflake
-            try:
-                final_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
-            except Exception:
-                final_severity = calculated_severity
+            # --- 2. INSERT ANOMALY (If Detected) ---
+            suggestion_result = None
+            if anomaly_details['is_anomaly']:
+                try:
+                    final_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
+                except Exception:
+                    final_severity = calculated_severity
 
-            try:
-                devs = [v.get('deviation_pct', 0.0) for v in anomaly_details.get('violations', []) if v.get('deviation_pct') is not None]
-                avg_dev = float(sum(devs) / len(devs)) if devs else 0.0
-            except Exception:
-                avg_dev = 0.0
-
-            logging.info(f"[AnomalyInsert] well={well_id} anomalies={len(anomaly_details.get('violations', []))} anomaly_score={anomaly_details.get('anomaly_score')} avg_deviation={avg_dev:.2f} final_severity={final_severity}")
-
-            violation_summary = "; ".join([v['violation'] for v in anomaly_details['violations']])
-            raw_values = json.dumps(readings, cls=CustomJSONEncoder, default=str)
-            cursor = conn.cursor()
-            try:
-                anomaly_params = (
+                violation_summary = "; ".join([v['violation'] for v in anomaly_details['violations']])
+                raw_values = json.dumps(readings, cls=CustomJSONEncoder, default=str)
+                
+                # Parameters for well_anomalies (9 items)
+                anomaly_params = [
                     well_id,
                     timestamp_str,
                     violation_summary,
@@ -816,7 +744,9 @@ def insert_reading():
                     'New',
                     final_severity,
                     lift_type
-                )
+                ]
+                
+                # FIXED: Use 'SELECT' instead of 'VALUES' for TRY_PARSE_JSON support
                 cursor.execute(
                     """
                     INSERT INTO well_anomalies
@@ -825,197 +755,147 @@ def insert_reading():
                     """,
                     anomaly_params
                 )
-                conn.commit()
-            finally:
-                cursor.close()
-
-            ### CRITICAL FIX: SIMILARITY SEARCH WITHOUT SQL FILTERING ###
-            
-            recent_anomalies_for_prompt = []
-            try:
-                # CRITICAL: Fetch WITHOUT SQL pre-filtering
-                # The old SQL filter was too strict and caused empty results
-                hist_anomalies_df = get_historical_anomalies(
-                    limit=200,  # Increased to get more candidates
-                    filter_clauses=None,  # No SQL filtering
-                    filter_params=None     # No SQL filtering
+                
+                # Fetch the generated ID for this anomaly
+                cursor.execute(
+                    "SELECT ID FROM well_anomalies WHERE well_id = %s AND timestamp = %s ORDER BY ID DESC LIMIT 1",
+                    (well_id, timestamp_str)
                 )
- 
-                # Filter out the CURRENT anomaly we just inserted
-                if not hist_anomalies_df.empty:
-                    try:
-                        hist_anomalies_df['ts_temp'] = pd.to_datetime(hist_anomalies_df['timestamp'], utc=True)
-                        current_ts = pd.to_datetime(timestamp_str, utc=True)
-                        
-                        mask = (hist_anomalies_df['well_id'] == well_id) & \
-                               ((hist_anomalies_df['ts_temp'] - current_ts).abs() < pd.Timedelta(seconds=1))
-                        
-                        hist_anomalies_df = hist_anomalies_df[~mask].drop(columns=['ts_temp'])
-                        
-                        if mask.any():
-                            logging.info(f"Filtered out self-reference for {well_id} at {timestamp_str}")
-                    except Exception as e:
-                        logging.warning(f"Error filtering self-reference: {e}")
+                row = cursor.fetchone()
+                current_anomaly_id = row[0] if row else None
 
-                # Perform STRICT 20% tolerance check in Python
+                # Insert Violations (using the fetched Numeric ID)
+                if current_anomaly_id and anomaly_details.get('violations'):
+                    query_vio = """
+                    INSERT INTO anomaly_violations_new
+                    (anomaly_id, well_id, timestamp, parameter_name, actual_value, expected_min, expected_max, unit, deviation_percent)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    
+                    for v in anomaly_details['violations']:
+                        dev_pct = v.get('deviation_pct', 0.0)
+                        e_min = v.get('min') if v.get('min') is not None else 0.0
+                        e_max = v.get('max') if v.get('max') is not None else 0.0
+                        
+                        params_vio = (
+                            current_anomaly_id, # Numeric ID link
+                            well_id,
+                            timestamp_str,
+                            v.get('field'),
+                            v.get('value'),
+                            e_min,
+                            e_max,
+                            v.get('unit', ''),
+                            dev_pct
+                        )
+                        cursor.execute(query_vio, params_vio)
+                        
+                conn.commit()
+
+                # --- 3. SIMILARITY SEARCH & AI ---
                 recent_anomalies_for_prompt = find_similar_anomalies(
                     current_readings=readings,
                     current_violations=anomaly_details.get('violations', []),
-                    historical_df=hist_anomalies_df,
                     current_well_id=well_id,
                     lift_type=lift_type,
-                    similarity_threshold=0.8,
-                    max_deviation_percent=20.0  # Strict 20% tolerance
+                    max_deviation_percent=20.0,
+                    exclude_anomaly_id=current_anomaly_id 
                 )
                 
-                if recent_anomalies_for_prompt:
-                    logging.info(f"✓ Found {len(recent_anomalies_for_prompt)} similar anomalies (20% tolerance)")
-                else:
-                    logging.info(f"No similar anomalies found for well {well_id} (20% tolerance)")
-                    
-            except Exception as e:
-                logging.error(f"Could not fetch similarity-based historical anomalies: {e}")
-            
-            ### END: SIMILARITY SEARCH INTEGRATION ###
-
-            # Augment anomaly_details if needed
-            augmented_anomaly_details = anomaly_details.copy()
-            try:
+                augmented_anomaly_details = anomaly_details.copy()
                 if (not augmented_anomaly_details.get('violations')) and lift_type and DYNAMIC_CONFIG_AVAILABLE:
-                    sensor_ranges = get_sensor_ranges(lift_type)
-                    synth_violations = []
-                    for field, val in readings.items():
-                        if val is None:
-                            continue
-                        if field in sensor_ranges:
-                            sr = sensor_ranges[field]
-                            mn = sr.get('min')
-                            mx = sr.get('max')
-                            unit = sr.get('unit') or ""
-                            if mn is not None and mx is not None and (val < mn or val > mx):
-                                rng = mx - mn if (mx - mn) != 0 else 1
-                                if val < mn:
-                                    deviation = ((mn - val) / rng) * 100
-                                else:
-                                    deviation = ((val - mx) / rng) * 100
-                                violation_text = f"Out of range. Expected {mn}-{mx} {unit}, got {val} {unit} ({deviation:.1f}% deviation)"
-                                synth_violations.append({
-                                    'field': field,
-                                    'value': val,
-                                    'min': mn,
-                                    'max': mx,
-                                    'unit': unit,
-                                    'deviation_pct': round(deviation, 2),
-                                    'violation': violation_text
-                                })
+                    try:
+                        sensor_ranges = get_sensor_ranges(lift_type)
+                        synth_violations = []
+                        for field, val in readings.items():
+                            if val is None: continue
+                            if field in sensor_ranges:
+                                sr = sensor_ranges[field]
+                                mn = sr.get('min')
+                                mx = sr.get('max')
+                                unit = sr.get('unit') or ""
+                                if mn is not None and mx is not None and (val < mn or val > mx):
+                                    rng = mx - mn if (mx - mn) != 0 else 1
+                                    if val < mn: deviation = ((mn - val) / rng) * 100
+                                    else: deviation = ((val - mx) / rng) * 100
+                                    synth_violations.append({
+                                        'field': field, 'value': val, 'min': mn, 'max': mx, 'unit': unit,
+                                        'deviation_pct': round(deviation, 2),
+                                        'violation': f"Out of range. Expected {mn}-{mx} {unit}, got {val}"
+                                    })
+                        if synth_violations:
+                            augmented_anomaly_details['violations'] = synth_violations
+                    except:
+                        pass
 
-                    if synth_violations:
-                        augmented_anomaly_details['violations'] = synth_violations
-                        augmented_anomaly_details['summary'] = f"{len(synth_violations)} synthetic violation(s) augmented from dynamic config"
-            except Exception:
-                augmented_anomaly_details = anomaly_details
+                suggestion_result = generate_suggestion(
+                    augmented_anomaly_details,
+                    well_id,
+                    readings,
+                    timestamp_str,
+                    historical_anomalies=recent_anomalies_for_prompt,
+                    lift_type=lift_type
+                )
 
-            if augmented_anomaly_details is not anomaly_details:
-                anomaly_details = augmented_anomaly_details
-
-            suggestion_result = generate_suggestion(
-                anomaly_details,
-                well_id,
-                readings,
-                timestamp_str,
-                historical_anomalies=recent_anomalies_for_prompt,
-                lift_type=lift_type
-            )
-
-            asset_id = f"ALT-{random.randint(100000, 999999)}"
-            if suggestion_result is None:
-                suggestion_result = {}
-            suggestion_result['asset_id'] = asset_id
-
-            # Enforce severity and confidence
-            try:
-                forced_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
-                a_score = float(anomaly_details.get('anomaly_score', 0.0) or 0.0)
+                asset_id = f"ALT-{random.randint(100000, 999999)}"
+                if not suggestion_result: suggestion_result = {}
+                suggestion_result['asset_id'] = asset_id
 
                 try:
+                    forced_severity = calculate_severity(anomaly_details, anomaly_details.get('anomaly_score', 0), readings)
+                    a_score = float(anomaly_details.get('anomaly_score', 0.0) or 0.0)
                     conf_val = int(round(max(0.0, min(1.0, a_score)) * 100))
-                except Exception:
-                    conf_val = 0
-                conf_val = max(1, min(99, conf_val))
+                    conf_val = max(1, min(99, conf_val))
+                    suggestion_result['severity'] = forced_severity
+                    suggestion_result['confidence'] = f"{int(conf_val)}%"
+                except:
+                    pass
 
-                suggestion_result['severity'] = forced_severity
-                suggestion_result['confidence'] = f"{int(conf_val)}%"
-                logging.info(f"[SuggestionOverride] well={well_id} forced_severity={forced_severity} anomaly_score={a_score:.3f} confidence={conf_val}%")
-            except Exception:
-                logging.exception("Failed to enforce suggestion severity/confidence; leaving AI output as-is")
-
-            # 5. Store Suggestion in Postgres
-            pg_conn_insert = get_pg_connection()
-            if pg_conn_insert:
-                try:
-                    with pg_conn_insert.cursor() as cur:
-                        insert_query = """
-                            INSERT INTO anomaly_suggestions 
-                            (id, well_id, asset_id, lift_type, timestamp, alert_title, severity, status, confidence, description, suggested_actions, explanation, historical_context, risk_analysis, raw_anomaly_data)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """
-                        insert_values = (
-                            str(uuid4()),
-                            well_id,
-                            suggestion_result.get('asset_id'),
-                            lift_type,
-                            timestamp_str,
-                            suggestion_result.get('alert_title'),
-                            suggestion_result.get('severity'),
-                            suggestion_result.get('status'),
-                            suggestion_result.get('confidence'),
-                            suggestion_result.get('description'),
-                            json.dumps(suggestion_result.get('suggested_actions'), cls=CustomJSONEncoder, default=str),
-                            suggestion_result.get('explanation'),
-                            json.dumps(suggestion_result.get('historical_context', {}), cls=CustomJSONEncoder, default=str),
-                            json.dumps(suggestion_result.get('risk_analysis', {}), cls=CustomJSONEncoder, default=str),
-                            json.dumps(anomaly_details, cls=CustomJSONEncoder, default=str)
-                        )
-                        
-                        cur.execute(insert_query, insert_values)
-                    pg_conn_insert.commit()
-                    logging.info(f"✓ Saved suggestion for {well_id} with lift_type={lift_type} to Postgres")
-                except Exception as pg_e:
-                    logging.error(f"✗ Error storing suggestion in Postgres: {pg_e}")
-                    if pg_conn_insert:
+                pg_conn_insert = get_pg_connection()
+                if pg_conn_insert:
+                    try:
+                        with pg_conn_insert.cursor() as cur:
+                            insert_query = """
+                                INSERT INTO anomaly_suggestions 
+                                (id, well_id, asset_id, lift_type, timestamp, alert_title, severity, status, confidence, description, suggested_actions, explanation, historical_context, risk_analysis, raw_anomaly_data)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """
+                            insert_values = (
+                                str(uuid4()), well_id, suggestion_result.get('asset_id'), lift_type, timestamp_str,
+                                suggestion_result.get('alert_title'), suggestion_result.get('severity'),
+                                suggestion_result.get('status'), suggestion_result.get('confidence'),
+                                suggestion_result.get('description'),
+                                json.dumps(suggestion_result.get('suggested_actions'), cls=CustomJSONEncoder, default=str),
+                                suggestion_result.get('explanation'),
+                                json.dumps(suggestion_result.get('historical_context', {}), cls=CustomJSONEncoder, default=str),
+                                json.dumps(suggestion_result.get('risk_analysis', {}), cls=CustomJSONEncoder, default=str),
+                                json.dumps(anomaly_details, cls=CustomJSONEncoder, default=str)
+                            )
+                            cur.execute(insert_query, insert_values)
+                        pg_conn_insert.commit()
+                    except Exception as pg_e:
+                        logging.error(f"Error storing suggestion: {pg_e}")
                         pg_conn_insert.rollback()
-                finally:
-                    if pg_conn_insert:
+                    finally:
                         pg_conn_insert.close()
-            else:
-                logging.warning(f"✗ PostgreSQL connection failed for well {well_id} - suggestion NOT stored")
 
-        conn.close()
-        
-        def convert_types(obj):
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.bool_):
-                return bool(obj)
-            elif isinstance(obj, dict):
-                return {k: convert_types(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_types(item) for item in obj]
-            return obj
+        finally:
+            cursor.close()
+            conn.close()
         
         return jsonify({
             "success": True,
-            "message": f"Reading inserted successfully for well {well_id}",
-            "anomaly_detected": convert_types(anomaly_details['is_anomaly']),
-            "anomaly_score": convert_types(anomaly_details['anomaly_score']),
-            "summary": anomaly_details['summary'],
-            "violations": convert_types(anomaly_details['violations']),
-            "suggestion": convert_types(suggestion_result)
+            "message": f"Reading inserted for {well_id}",
+            "anomaly_detected": anomaly_details['is_anomaly'],
+            "anomaly_score": anomaly_details['anomaly_score'],
+            "violations": anomaly_details['violations'],
+            "suggestion": suggestion_result
         }), 200
+
     except Exception as e:
         logging.error(f"Error inserting reading: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
         return jsonify({"error": f"Database error: {str(e)}"}), 500
 
 @app.route('/api/well-history/<well_id>', methods=['GET'])
@@ -1023,26 +903,11 @@ def get_well_history(well_id):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
         try:
-            cursor.execute(
-                """
-                SELECT * FROM well_sensor_readings
-                WHERE well_id = %s
-                ORDER BY timestamp DESC
-                LIMIT 20
-                """,
-                (well_id,)
-            )
+            cursor.execute("SELECT * FROM well_sensor_readings WHERE well_id = %s ORDER BY timestamp DESC LIMIT 20", (well_id,))
             rows = cursor.fetchall()
-            if rows and cursor.description:
-                cols = [c[0].lower() for c in cursor.description]
-                readings_df = pd.DataFrame(rows, columns=cols)
-            else:
-                readings_df = pd.DataFrame()
-        except Exception as e:
-            logging.error(f"Error fetching readings: {e}")
-            readings_df = pd.DataFrame()
+            cols = [c[0].lower() for c in cursor.description] if cursor.description else []
+            readings_df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
         finally:
             cursor.close()
 
@@ -1051,57 +916,36 @@ def get_well_history(well_id):
         if pg_conn:
             try:
                 with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT * FROM anomaly_suggestions 
-                        WHERE well_id = %s 
-                        ORDER BY timestamp DESC 
-                        LIMIT 20
-                    """, (well_id,))
+                    cur.execute("SELECT * FROM anomaly_suggestions WHERE well_id = %s ORDER BY timestamp DESC LIMIT 20", (well_id,))
                     suggestions_list = cur.fetchall()
                     for item in suggestions_list:
                         item['timestamp'] = str(item.get('timestamp'))
                         item['created_at'] = str(item.get('created_at'))
-            except Exception as e:
-                logging.error(f"Error fetching Postgres history: {e}")
+            except Exception:
+                pass
             finally:
-                if pg_conn:
-                    pg_conn.close()
+                pg_conn.close()
 
         if not suggestions_list:
             cursor = conn.cursor()
             try:
-                cursor.execute(
-                    """
-                    SELECT * FROM well_anomalies
-                    WHERE well_id = %s
-                    ORDER BY timestamp DESC
-                    LIMIT 20
-                    """,
-                    (well_id,)
-                )
+                cursor.execute("SELECT * FROM well_anomalies WHERE well_id = %s ORDER BY timestamp DESC LIMIT 20", (well_id,))
                 rows = cursor.fetchall()
-                if rows and cursor.description:
-                    cols = [c[0].lower() for c in cursor.description]
-                    anomalies_df = pd.DataFrame(rows, columns=cols)
-                else:
-                    anomalies_df = pd.DataFrame()
-            except Exception as e:
-                logging.error(f"Error fetching legacy anomalies: {e}")
-                anomalies_df = pd.DataFrame()
+                cols = [c[0].lower() for c in cursor.description] if cursor.description else []
+                anomalies_df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
             finally:
                 cursor.close()
 
             for _, row in anomalies_df.iterrows():
                 record = row.to_dict()
-                record = {k: (None if pd.isna(v) or (isinstance(v, float) and np.isinf(v)) else v) for k, v in record.items()}
-                if 'timestamp' in record:
-                    record['timestamp'] = str(record['timestamp'])
+                record = {k: (None if pd.isna(v) else v) for k, v in record.items()}
+                if 'timestamp' in record: record['timestamp'] = str(record['timestamp'])
                 suggestions_list.append({
                     "alert_title": "Anomaly Detected (Legacy)",
                     "severity": "UNKNOWN",
                     "status": record.get("status", "New"),
                     "confidence": "N/A",
-                    "description": record.get("anomaly_type", "Unknown issue"),
+                    "description": record.get("anomaly_type", "Unknown"),
                     "timestamp": record.get("timestamp"),
                     "raw_anomaly_data": record
                 })
@@ -1111,9 +955,8 @@ def get_well_history(well_id):
         readings_list = []
         for _, row in readings_df.iterrows():
             record = row.to_dict()
-            record = {k: (None if pd.isna(v) or (isinstance(v, float) and np.isinf(v)) else v) for k, v in record.items()}
-            if 'timestamp' in record:
-                record['timestamp'] = str(record['timestamp'])
+            record = {k: (None if pd.isna(v) else v) for k, v in record.items()}
+            if 'timestamp' in record: record['timestamp'] = str(record['timestamp'])
             readings_list.append(record)
         
         return jsonify({
@@ -1122,7 +965,6 @@ def get_well_history(well_id):
             "anomalies": suggestions_list 
         }), 200
     except Exception as e:
-        logging.error(f"Error fetching history: {str(e)}")
         return jsonify({"error": f"Database error: {str(e)}"}), 500
 
 @app.route('/api/wells', methods=['GET'])
@@ -1131,26 +973,15 @@ def get_wells():
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                """
-                SELECT DISTINCT well_id FROM well_sensor_readings
-                ORDER BY well_id
-                """
-            )
+            cursor.execute("SELECT DISTINCT well_id FROM well_sensor_readings ORDER BY well_id")
             rows = cursor.fetchall()
-            if rows and cursor.description:
-                cols = [c[0].lower() for c in cursor.description]
-                wells_df = pd.DataFrame(rows, columns=cols)
-                wells = wells_df['well_id'].tolist() if 'well_id' in wells_df.columns else [r[0] for r in rows]
-            else:
-                wells = []
+            wells = [r[0] for r in rows] if rows else []
         finally:
             cursor.close()
             conn.close()
         return jsonify({"wells": wells}), 200
     except Exception as e:
-        logging.error(f"Error fetching wells: {str(e)}")
-        return jsonify({"error": f"Database error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -1161,33 +992,14 @@ def get_operation_recommendations():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        query = """
-        SELECT 
-            ID,
-            WELL_ID,
-            ACTION,
-            PRIORITY,
-            STATUS,
-            REASON,
-            EXPECTED_IMPACT,
-            CONFIDENCE,
-            PREDICTION_SOURCE,
-            PROBABILITY,
-            DETAILS,
-            CREATED_AT
-        FROM OPERATION_RECOMMENDATION
-        ORDER BY CREATED_AT DESC, WELL_ID
-        """
-        
-        cursor.execute(query)
+        cursor.execute("""
+        SELECT ID, WELL_ID, ACTION, PRIORITY, STATUS, REASON, EXPECTED_IMPACT, CONFIDENCE, PREDICTION_SOURCE, PROBABILITY, DETAILS, CREATED_AT
+        FROM OPERATION_RECOMMENDATION ORDER BY CREATED_AT DESC, WELL_ID
+        """)
         results = cursor.fetchall()
-        
         columns = [desc[0].lower() for desc in cursor.description] if cursor.description else []
-        
         cursor.close()
         conn.close()
-        
         recommendations = []
         if results:
             for row in results:
@@ -1195,154 +1007,71 @@ def get_operation_recommendations():
                 for i, col in enumerate(columns):
                     rec[col] = row[i] if i < len(row) else None
                 recommendations.append(rec)
-        
-        logging.info(f"Retrieved {len(recommendations)} operation recommendations")
-        return jsonify({
-            "status": "success",
-            "count": len(recommendations),
-            "recommendations": recommendations
-        }), 200
-        
+        return jsonify({"status": "success", "count": len(recommendations), "recommendations": recommendations}), 200
     except Exception as e:
-        logging.exception(f"Error fetching operation recommendations: {e}")
-        import traceback
-        tb = traceback.format_exc()
-        return jsonify({"error": str(e), "traceback": tb}), 500
-
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/operation-suggestions', methods=['GET'])
 def get_operation_suggestions_api():
-    """Retrieve operation suggestions from PostgreSQL."""
     try:
         well_id = request.args.get('well_id')
         status = request.args.get('status')
         priority = request.args.get('priority')
         limit = int(request.args.get('limit', 100))
-        
         suggestions = get_operation_suggestions(well_id=well_id, status=status, priority=priority, limit=limit)
-        
         for sugg in suggestions:
             for key, value in sugg.items():
-                if hasattr(value, 'isoformat'):
-                    sugg[key] = value.isoformat()
-        
-        logging.info(f"Retrieved {len(suggestions)} operation suggestions")
-        return jsonify({
-            "status": "success",
-            "count": len(suggestions),
-            "suggestions": suggestions
-        }), 200
-        
+                if hasattr(value, 'isoformat'): sugg[key] = value.isoformat()
+        return jsonify({"status": "success", "count": len(suggestions), "suggestions": suggestions}), 200
     except Exception as e:
-        logging.error(f"Error fetching operation suggestions: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 @app.route('/api/operation-suggestions/<suggestion_id>', methods=['GET'])
 def get_operation_suggestion_api(suggestion_id):
-    """Retrieve detailed info about a specific operation suggestion."""
     try:
         suggestion = get_operation_suggestion_detail(suggestion_id)
-        
-        if not suggestion:
-            return jsonify({"status": "error", "message": "Suggestion not found"}), 404
-        
+        if not suggestion: return jsonify({"status": "error", "message": "Suggestion not found"}), 404
         for key, value in suggestion.items():
-            if hasattr(value, 'isoformat'):
-                suggestion[key] = value.isoformat()
-        
-        return jsonify({
-            "status": "success",
-            "suggestion": suggestion
-        }), 200
-        
+            if hasattr(value, 'isoformat'): suggestion[key] = value.isoformat()
+        return jsonify({"status": "success", "suggestion": suggestion}), 200
     except Exception as e:
-        logging.error(f"Error fetching suggestion detail: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 @app.route('/api/operation-suggestions', methods=['POST'])
 def create_operation_suggestion_api():
-    """Create a new operation suggestion with OpenAI-generated detailed content."""
     try:
         data = request.get_json()
-        
         well_id = data.get('well_id')
         action = data.get('action')
-        status = data.get('status', 'New')
-        priority = data.get('priority', 'HIGH')
-        confidence = float(data.get('confidence', 0.0))
-        production_data = data.get('production_data')
-        sensor_metrics = data.get('sensor_metrics')
-        reason = data.get('reason', '')
-        expected_impact = data.get('expected_impact', '')
-        
-        if not well_id or not action:
-            return jsonify({
-                "status": "error",
-                "message": "well_id and action are required"
-            }), 400
+        if not well_id or not action: return jsonify({"status": "error", "message": "Required fields missing"}), 400
         
         success = save_operation_suggestion(
             well_id=well_id,
             action=action,
-            status=status,
-            priority=priority,
-            confidence=confidence,
-            production_data=production_data,
-            sensor_metrics=sensor_metrics,
-            reason=reason,
-            expected_impact=expected_impact
+            status=data.get('status', 'New'),
+            priority=data.get('priority', 'HIGH'),
+            confidence=float(data.get('confidence', 0.0)),
+            production_data=data.get('production_data'),
+            sensor_metrics=data.get('sensor_metrics'),
+            reason=data.get('reason', ''),
+            expected_impact=data.get('expected_impact', '')
         )
-        
-        if success:
-            return jsonify({
-                "status": "success",
-                "message": f"Operation suggestion created for {well_id}",
-                "well_id": well_id,
-                "action": action
-            }), 201
-        else:
-            return jsonify({
-                "status": "error",
-                "message": "Failed to create operation suggestion"
-            }), 500
-        
+        if success: return jsonify({"status": "success", "message": "Created"}), 201
+        return jsonify({"status": "error", "message": "Failed"}), 500
     except Exception as e:
-        logging.error(f"Error creating operation suggestion: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 @app.route('/api/operation-suggestions/<suggestion_id>/status', methods=['PUT'])
 def update_operation_suggestion_status_api(suggestion_id):
-    """Update the status of an operation suggestion."""
     try:
         data = request.get_json()
         new_status = data.get('status')
-        
-        if not new_status:
-            return jsonify({
-                "status": "error",
-                "message": "status is required"
-            }), 400
-        
+        if not new_status: return jsonify({"status": "error", "message": "status required"}), 400
         success = update_operation_suggestion_status(suggestion_id, new_status)
-        
-        if success:
-            return jsonify({
-                "status": "success",
-                "message": f"Suggestion status updated to {new_status}"
-            }), 200
-        else:
-            return jsonify({
-                "status": "error",
-                "message": "Failed to update suggestion status"
-            }), 500
-        
+        if success: return jsonify({"status": "success"}), 200
+        return jsonify({"status": "error", "message": "Failed"}), 500
     except Exception as e:
-        logging.error(f"Error updating suggestion status: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 if __name__ == '__main__':
     debug_mode = os.getenv("APP_DEBUG", "False").lower() == "true"

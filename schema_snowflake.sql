@@ -47,3 +47,20 @@ CREATE TABLE IF NOT EXISTS AT_RISK_ASSETS.SENSOR_DATA.well_anomalies (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (id)
 );
+
+-- Table 4: Anomaly Reviews
+CREATE TABLE IF NOT EXISTS AT_RISK_ASSETS.SENSOR_DATA.ANOMALY_REVIEW (
+    well_id VARCHAR,
+    event_date DATE,
+    detected_at TIMESTAMP,
+    anomaly_code VARCHAR,
+    category VARCHAR,
+    severity VARCHAR,
+    title VARCHAR,
+    ui_text VARIANT,
+    impact_value FLOAT,
+    impact_unit VARCHAR,
+    chart_data VARIANT,
+    status VARCHAR,
+    PRIMARY KEY (well_id, anomaly_code, event_date)
+);

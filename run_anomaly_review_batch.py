@@ -134,7 +134,7 @@ def insert_anomalies_to_db(results):
             
             insert_data.append((
                 r['well_id'],
-                r['timestamp'],
+                str(r['timestamp']), # Convert Timestamp to string
                 r['title'],     # anomaly_type
                 1.0,            # score
                 raw_values_json,  # raw_values as JSON string
@@ -145,12 +145,13 @@ def insert_anomalies_to_db(results):
             ))
         
         if insert_data:
-            # Use strict loop to handle PARSE_JSON safely (executemany can fail with function calls in VALUES)
+            # parsing JSON in VALUES clause can be problematic with parameters in standard cursor
+            # Switching to INTO ... SELECT syntax which handles functions on parameters better
             insert_query = """
                 INSERT INTO well_anomalies 
                 (well_id, timestamp, anomaly_type, anomaly_score, raw_values, 
                  model_name, status, severity, category)
-                VALUES (%s, %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, %s)
+                SELECT %s, %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, %s
             """
             for row in insert_data:
                 cursor.execute(insert_query, row)
