@@ -317,8 +317,17 @@ class AnomalyDetector:
             if not features:
                 return 0.0
             
-            # Extract values in correct order
-            values = np.array([[readings.get(f, 0.0) for f in features]])
+            # Extract values in correct order, handling None safely
+            def get_safe_value(d, k):
+                val = d.get(k)
+                if val is None:
+                    return 0.0
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return 0.0
+
+            values = np.array([[get_safe_value(readings, f) for f in features]])
             
             anomaly_scores = []
             
