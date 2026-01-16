@@ -24,13 +24,16 @@ sys.path.insert(0, '/home/abhishekkumar/Desktop/porjects/at-risk-assets')
 from operational_recommendations import (
     train_with_synthetic_labels,
     predict_all_wells,
-    load_model
+    load_model,
+    generate_recommendations_for_well,
+    ACTION_CATEGORY_MAP
 )
 
 from operation import (
     save_operation_suggestion,
     get_operation_suggestions,
-    create_operation_suggestion_table
+    create_operation_suggestion_table,
+    infer_action_category_priority
 )
 
 import os
@@ -156,12 +159,19 @@ def process_recommendations(predictions, snowflake_conn):
             # Note: Snowflake storage already handled by predict_all_wells()
             # So we just need to save to PostgreSQL with OpenAI details
             
-            logger.info(f"  ↓ Generating OpenAI analysis for PostgreSQL...")
+            logger.info(f"  ↓ Inferring action/category/priority via OpenAI...")
+            inferred = infer_action_category_priority(well_id, production_data, sensor_metrics, hint=action)
+            inferred_action = inferred.get('action')
+            inferred_category = inferred.get('category')
+            inferred_priority = inferred.get('priority')
+
+            logger.info(f"  ↓ Generating OpenAI analysis for PostgreSQL with inferred action/category...")
             success = save_operation_suggestion(
                 well_id=well_id,
-                action=action,
+                action=inferred_action,
+                category=inferred_category,
                 status="New",
-                priority="HIGH" if probability > 0.85 else "MEDIUM",
+                priority=inferred_priority or ("HIGH" if probability > 0.85 else "MEDIUM"),
                 confidence=probability * 100,  # Convert to percentage
                 production_data=production_data,
                 sensor_metrics=sensor_metrics,
@@ -188,6 +198,31 @@ def process_recommendations(predictions, snowflake_conn):
                     'snowflake': True,
                     'postgres': False
                 })
+
+            # Also generate and save rule-based recommendations for the same well
+            try:
+                rule_recs = generate_recommendations_for_well(snowflake_conn, well_id)
+                for rr in rule_recs:
+                    ra = rr.get('action') or rr.get('recommendation') or ''
+                    rcat = rr.get('category') or ACTION_CATEGORY_MAP.get(ra, 'Production')
+                    rprio = rr.get('priority') or 'MEDIUM'
+                    rconf = rr.get('confidence') or rr.get('probability') or 0.0
+                    saved = save_operation_suggestion(
+                        well_id=well_id,
+                        action=ra,
+                        category=rcat,
+                        status='New',
+                        priority=rprio,
+                        confidence=(rconf * 100) if rconf and rconf <= 1 else rconf,
+                        production_data=production_data,
+                        sensor_metrics=sensor_metrics,
+                        reason='Rule-based recommendation',
+                        expected_impact=rr.get('expected_impact', '')
+                    )
+                    if saved:
+                        stats['saved_postgres'] += 1
+            except Exception as e:
+                logger.warning(f"Rule-based recommendations failed for {well_id}: {e}")
         
         except Exception as e:
             logger.error(f"Error processing recommendation for {well_id}: {e}", exc_info=True)

@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 import pandas as pd
 import numpy as np
 import json
@@ -61,6 +61,7 @@ from operation import (
     update_operation_suggestion_status,
     get_operation_suggestion_detail,
     get_pg_connection
+    , stream_run_operational_pipeline
 )
 
 try:
@@ -1010,6 +1011,23 @@ def get_operation_recommendations():
         return jsonify({"status": "success", "count": len(recommendations), "recommendations": recommendations}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/run-pipeline', methods=['GET'])
+def run_pipeline_api():
+    """Run the operational pipeline with optional `confidence` query param and stream logs via SSE."""
+    confidence = request.args.get('confidence', '0.2')
+    try:
+        # validate numeric
+        _ = float(confidence)
+    except Exception:
+        confidence = '0.2'
+
+    def generator():
+        for chunk in stream_run_operational_pipeline(confidence):
+            yield chunk
+
+    return Response(stream_with_context(generator()), mimetype='text/event-stream')
 
 @app.route('/api/operation-suggestions', methods=['GET'])
 def get_operation_suggestions_api():

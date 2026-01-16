@@ -650,6 +650,21 @@
             >
               📋 AI Recommendations
             </button>
+            <button
+              type="button"
+              id="runPipeline"
+              style="
+                margin-top: 8px;
+                margin-left: 6px;
+                background: linear-gradient(45deg, #081c2e 0%, #00f0ff 100%);
+                color: #001;
+                border: none;
+                padding: 8px 10px;
+                border-radius: 3px;
+              "
+            >
+              ⚡ Run Pipeline
+            </button>
           </div>
 
           <div
@@ -711,6 +726,34 @@
 
             <h3>AI Directives</h3>
             <div id="recommendationsJson"></div>
+          </div>
+          <div id="pipelineLogWrap" style="display: none; margin-top: 12px">
+            <h3
+              style="
+                color: var(--primary-cyan);
+                font-size: 0.9rem;
+                font-family: 'Orbitron', sans-serif;
+                margin-bottom: 6px;
+              "
+            >
+              ⚡ Pipeline Output
+            </h3>
+            <pre
+              id="pipelineLog"
+              style="
+                background: #000;
+                color: #00ffcc;
+                padding: 10px;
+                border-radius: 4px;
+                max-height: 320px;
+                overflow: auto;
+                border: 1px solid #123;
+                font-family: 'Fira Code', monospace;
+                font-size: 0.78rem;
+              "
+            >
+Starting...</pre
+            >
           </div>
         </div>
       </div>
@@ -796,6 +839,99 @@
           console.error("Error loading wells:", error);
         }
       }
+
+      // Run Pipeline (SSE streaming)
+      (function setupRunPipeline() {
+        const btn = document.getElementById("runPipeline");
+        const logWrap = document.getElementById("pipelineLogWrap");
+        const logPre = document.getElementById("pipelineLog");
+        if (!btn) return;
+
+        btn.addEventListener("click", async () => {
+          // Ask for optional confidence, default 0.2
+          let conf = prompt("Confidence threshold (0.0 - 1.0)", "0.2");
+          if (conf === null) return;
+          conf = conf.trim() || "0.2";
+
+          btn.disabled = true;
+          btn.textContent = "⚡ Running...";
+          logWrap.style.display = "block";
+          logPre.textContent = `Starting pipeline (confidence=${conf})...\n`;
+
+          const es = new EventSource(
+            `/api/run-pipeline?confidence=${encodeURIComponent(conf)}`
+          );
+
+          es.onmessage = (e) => {
+            try {
+              const obj = JSON.parse(e.data);
+              switch (obj.type) {
+                case "processing":
+                  logPre.textContent += `Processing: ${obj.well_id.trim()} — ${obj.action.trim()} (conf: ${
+                    obj.confidence
+                  })\n`;
+                  break;
+                case "saved":
+                  logPre.textContent += `Saved ➜ ${obj.well_id || "N/A"} — ${
+                    obj.action || ""
+                  }\n`;
+                  break;
+                case "failed_save":
+                  logPre.textContent += `Save FAILED ➜ ${
+                    obj.well_id || "N/A"
+                  } — ${obj.action || ""} — ${obj.message}\n`;
+                  break;
+                case "predictions":
+                  logPre.textContent += `Predictions completed: ${obj.count}\n`;
+                  break;
+                case "stage":
+                  logPre.textContent += `== ${obj.message} ==\n`;
+                  break;
+                case "train_summary":
+                  logPre.textContent += `Training: ${obj.message}\n`;
+                  break;
+                case "detail":
+                  logPre.textContent += `${obj.well_id} | ${obj.action} | ${obj.confidence} | SF:${obj.sf} PG:${obj.pg}\n`;
+                  break;
+                case "summary":
+                  logPre.textContent += `${obj.key} ${obj.value}\n`;
+                  break;
+                case "info":
+                  logPre.textContent += `${obj.message}\n`;
+                  break;
+                case "finished":
+                  logPre.textContent += `\nProcess finished (code=${obj.returncode})\n`;
+                  btn.disabled = false;
+                  btn.textContent = "⚡ Run Pipeline";
+                  es.close();
+                  break;
+                case "error":
+                  logPre.textContent += `\nERROR: ${obj.message}\n`;
+                  btn.disabled = false;
+                  btn.textContent = "⚡ Run Pipeline";
+                  es.close();
+                  break;
+                default:
+                  // fallback: append raw
+                  logPre.textContent +=
+                    (obj.message || JSON.stringify(obj)) + "\n";
+              }
+            } catch (err) {
+              logPre.textContent += e.data + "\n";
+            }
+            logPre.scrollTop = logPre.scrollHeight;
+          };
+
+          es.onerror = (ev) => {
+            logPre.textContent += "\nStream closed or errored.\n";
+            btn.disabled = false;
+            btn.textContent = "⚡ Run Pipeline";
+            try {
+              es.close();
+            } catch (e) {}
+          };
+        });
+      })();
 
       // Handle form submission
       document
