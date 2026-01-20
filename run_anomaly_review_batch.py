@@ -13,12 +13,19 @@ from anomaly_review_service import detect_anomalies
 # =====================================================
 # CONFIG
 # =====================================================
-TEST_MODE = "true"
-TEST_WELL_LIMIT = 5
+TEST_MODE = True
+TEST_WELL_LIMIT = 1
+
+# 👉 Run batch for a specific well when testing (highest priority)
+# Set to None to disable
+TEST_WELL_ID = "Well_003_RodPump"  # e.g. "WELL_12345"
+
 MAX_WORKERS = 10
 # =====================================================
 
-# Setup Logging
+# =====================================================
+# LOGGING SETUP
+# =====================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -112,7 +119,9 @@ def run_batch():
 
     start_time = time.time()
 
-    # 1. Fetch wells
+    # -------------------------------------------------
+    # FETCH WELLS
+    # -------------------------------------------------
     wells = get_all_active_wells()
 
     if not wells:
@@ -124,8 +133,14 @@ def run_batch():
     # -------------------------------------------------
     if TEST_MODE:
         logger.warning("⚠️  TEST MODE ENABLED")
-        logger.warning(f"Processing only first {TEST_WELL_LIMIT} wells")
-        wells = wells[:TEST_WELL_LIMIT]
+
+        # 🎯 Highest priority: specific well
+        if TEST_WELL_ID:
+            logger.warning(f"Running for specific well_id: {TEST_WELL_ID}")
+            wells = [TEST_WELL_ID]
+        else:
+            logger.warning(f"Processing only first {TEST_WELL_LIMIT} wells")
+            wells = wells[:TEST_WELL_LIMIT]
 
     logger.info(f"Total wells to process: {len(wells)}")
 
@@ -141,7 +156,9 @@ def run_batch():
         "anomalies_found": 0,
     }
 
-    # 2. Parallel processing
+    # -------------------------------------------------
+    # PARALLEL PROCESSING
+    # -------------------------------------------------
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_well = {
             executor.submit(process_single_well, well): well
