@@ -165,14 +165,8 @@ def get_historical_anomalies(limit=200):
 
 def find_similar_anomalies(current_readings, current_violations, historical_df=None, current_well_id=None, lift_type=None, similarity_threshold=None, max_deviation_percent=20.0, exclude_anomaly_id=None):
     """
-    Find similar anomalies using a Split Strategy.
-    
-    1. Pass 1 (Same Well): Relaxed Match.
-    2. Pass 2 (Diff Well): Strict Match.
-    
-    SORTING PRIORITY:
-    1. Latest Timestamp (Newest first) - Enforced by SQL Order.
-    2. (Implicitly) Similarity is secondary to recency.
+    Find similar anomalies.
+    Restricted to ONLY check the SAME well ID.
     """
     if not current_violations:
         return []
@@ -216,10 +210,8 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
             
             where_range_sql = " OR ".join(where_clauses)
             
-            if is_same_well:
-                well_logic_sql = "a2.well_id = %s"
-            else:
-                well_logic_sql = "a2.well_id != %s"
+            # Logic: Strictly enforce same well ID
+            well_logic_sql = "a2.well_id = %s"
             params.append(current_well_id)
 
             if exclude_anomaly_id is not None:
@@ -285,7 +277,7 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
             valid_records = []
             for record in grouped.values():
                 hist_violations = record['raw_anomaly_data']['violations']
-                hist_all_keys = set(hv['field'] for hv in hist_violations)
+                # hist_all_keys = set(hv['field'] for hv in hist_violations)
                 
                 matched_keys_in_this_record = set()
 
@@ -300,23 +292,10 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
                     except:
                         continue
 
-                # --- DECISION ---
-                keep = False
-                if is_same_well:
-                    # Same Well: Relaxed (Keep if ANY matched)
-                    if len(matched_keys_in_this_record) > 0:
-                        keep = True
-                else:
-                    # Diff Well: STRICT (Sets must be identical & values close)
-                    sets_are_identical = (hist_all_keys == current_violation_keys)
-                    values_are_close = current_violation_keys.issubset(matched_keys_in_this_record)
-                    if sets_are_identical and values_are_close:
-                        keep = True
-                
-                if keep:
+                # Same Well: Relaxed (Keep if ANY matched)
+                if len(matched_keys_in_this_record) > 0:
                     valid_records.append(record)
             
-            # NO SORTING HERE. We keep the order from SQL (Time DESC).
             return valid_records
 
         except Exception as e:
@@ -326,14 +305,8 @@ def find_similar_anomalies(current_readings, current_violations, historical_df=N
             cursor.close()
 
     try:
-        # Pass 1: Same Well (Priority 1)
-        same_well_matches = fetch_candidates(is_same_well=True)
-        
-        # Pass 2: Different Wells (Priority 2)
-        diff_well_matches = fetch_candidates(is_same_well=False)
-        
-        # Merge
-        final_records = same_well_matches + diff_well_matches
+        # ONLY check the same well
+        final_records = fetch_candidates(is_same_well=True)
         
         # Cleanup
         for r in final_records:

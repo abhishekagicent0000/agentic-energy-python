@@ -1,169 +1,206 @@
-
 import os
 import sys
 import logging
 import time
-import json
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from snowflake.connector import connect as snowflake_connect
 
 # Import the service logic
 from anomaly_review_service import detect_anomalies
 
-# Setup Logging
+# =====================================================
+# CONFIG
+# =====================================================
+TEST_MODE = True
+TEST_WELL_LIMIT = 1
+
+# 👉 Run batch for a specific well when testing (highest priority)
+# Set to None to disable
+TEST_WELL_ID = "Well_003_RodPump"  # e.g. "WELL_12345"
+
+MAX_WORKERS = 10
+# =====================================================
+
+# =====================================================
+# LOGGING SETUP
+# =====================================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("batch_execution.log")
-    ]
+        logging.FileHandler("batch_execution.log"),
+    ],
 )
+
 logger = logging.getLogger("BatchRunner")
 
-# Load Env
 load_dotenv()
 
+
+# =====================================================
+# SNOWFLAKE CONNECTION
+# =====================================================
 def get_snowflake_conn():
     return snowflake_connect(
-        user=os.getenv('SNOWFLAKE_USER'),
-        password=os.getenv('SNOWFLAKE_PASSWORD'),
-        account=os.getenv('SNOWFLAKE_ACCOUNT'),
-        warehouse=os.getenv('SNOWFLAKE_WAREHOUSE'),
-        database=os.getenv('SNOWFLAKE_DATABASE'),
-        schema=os.getenv('SNOWFLAKE_SCHEMA'),
-        role=os.getenv('SNOWFLAKE_ROLE')
+        user=os.getenv("SNOWFLAKE_USER"),
+        password=os.getenv("SNOWFLAKE_PASSWORD"),
+        account=os.getenv("SNOWFLAKE_ACCOUNT"),
+        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
+        database=os.getenv("SNOWFLAKE_DATABASE"),
+        schema=os.getenv("SNOWFLAKE_SCHEMA"),
+        role=os.getenv("SNOWFLAKE_ROLE"),
     )
 
+
+# =====================================================
+# FETCH WELLS
+# =====================================================
 def get_all_active_wells():
-    """Fetches list of all distinct well IDs that have data in the last 30 days."""
+    """Fetch list of wells with data in last 7 days."""
     try:
         conn = get_snowflake_conn()
         cursor = conn.cursor()
-        
-        # We only care about wells that are actually reporting recently
+
         query = """
-        SELECT DISTINCT well_id 
-        FROM well_sensor_readings 
-        WHERE timestamp >= DATEADD(day, -30, CURRENT_DATE())
-        ORDER BY well_id
+            SELECT DISTINCT well_id
+            FROM well_sensor_readings
+            WHERE timestamp >= DATEADD(day, -7, CURRENT_DATE())
+            ORDER BY well_id
         """
+
         cursor.execute(query)
         wells = [row[0] for row in cursor.fetchall()]
+
+        cursor.close()
         conn.close()
+
         return wells
+
     except Exception as e:
         logger.error(f"Failed to fetch well list: {e}")
         return []
 
+
+# =====================================================
+# PROCESS SINGLE WELL
+# =====================================================
+def process_single_well(well_id):
+    """Wrapper function for parallel execution."""
+    try:
+        results = detect_anomalies(well_id)
+
+        return {
+            "well_id": well_id,
+            "count": len(results),
+            "titles": [r.get("title") for r in results],
+            "status": "success",
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing {well_id}: {e}")
+        return {
+            "well_id": well_id,
+            "count": 0,
+            "status": "failed",
+            "error": str(e),
+        }
+
+
+# =====================================================
+# RUN BATCH
+# =====================================================
 def run_batch():
-    logger.info("="*50)
-    logger.info("STARTING ANOMALY REVIEW BATCH")
-    logger.info("="*50)
-    
+    logger.info("=" * 60)
+    logger.info("STARTING ANOMALY REVIEW BATCH (PARALLEL)")
+    logger.info("=" * 60)
+
     start_time = time.time()
-    
-    # 1. Get List of Wells
+
+    # -------------------------------------------------
+    # FETCH WELLS
+    # -------------------------------------------------
     wells = get_all_active_wells()
+
     if not wells:
         logger.error("No active wells found. Exiting.")
         return
-        
-    logger.info(f"Found {len(wells)} active wells to process.")
-    
+
+    # -------------------------------------------------
+    # TEST MODE LOGIC
+    # -------------------------------------------------
+    if TEST_MODE:
+        logger.warning("⚠️  TEST MODE ENABLED")
+
+        # 🎯 Highest priority: specific well
+        if TEST_WELL_ID:
+            logger.warning(f"Running for specific well_id: {TEST_WELL_ID}")
+            wells = [TEST_WELL_ID]
+        else:
+            logger.warning(f"Processing only first {TEST_WELL_LIMIT} wells")
+            wells = wells[:TEST_WELL_LIMIT]
+
+    logger.info(f"Total wells to process: {len(wells)}")
+
+    logger.info("-" * 30)
+    logger.info("Target Wells:")
+    for w in wells:
+        logger.info(f" -> {w}")
+    logger.info("-" * 30)
+
     stats = {
         "processed": 0,
         "failed": 0,
         "anomalies_found": 0,
-        "start_time": datetime.now().isoformat()
     }
-    
-    # 2. Iterate
-    for i, well_id in enumerate(wells):
-        try:
-            # Progress Log
-            sys.stdout.write(f"\rProcessing {i+1}/{len(wells)}: {well_id}...")
+
+    # -------------------------------------------------
+    # PARALLEL PROCESSING
+    # -------------------------------------------------
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_well = {
+            executor.submit(process_single_well, well): well
+            for well in wells
+        }
+
+        for i, future in enumerate(as_completed(future_to_well)):
+            result = future.result()
+
+            sys.stdout.write(f"\rProgress: {i + 1}/{len(wells)}")
             sys.stdout.flush()
-            
-            # --- EXECUTE LOGIC ENGINE ---
-            results = detect_anomalies(well_id)
-            # ----------------------------
-            
-            stats["anomalies_found"] += len(results)
-            
-            # Optional: If results found, maybe log them briefly
-            if results:
-                logger.info(f"\n[!] Anomaly in {well_id}: {[r['title'] for r in results]}")
-                # We assume detect_anomalies internally might save to DB if configured, 
-                # or we handle it here. 
-                # For this implementation, detect_anomalies returns the list.
-                # In a real pipeline, we would INSERT into `well_anomalies`.
-                insert_anomalies_to_db(results)
-                
-            stats["processed"] += 1
-            
-        except Exception as e:
-            logger.error(f"\nFailed to process {well_id}: {e}")
-            stats["failed"] += 1
+
+            if result["status"] == "success":
+                stats["processed"] += 1
+                stats["anomalies_found"] += result["count"]
+
+                if result["count"] > 0:
+                    sys.stdout.write("\n")
+                    logger.info(
+                        f"[+] {result['well_id']}: "
+                        f"{result['count']} anomalies -> {result['titles']}"
+                    )
+            else:
+                stats["failed"] += 1
+                sys.stdout.write("\n")
+                logger.error(
+                    f"[-] {result['well_id']} failed: {result.get('error')}"
+                )
 
     total_time = time.time() - start_time
-    logger.info(f"\n\n{'='*50}")
+
+    logger.info("\n" + "=" * 60)
     logger.info("BATCH COMPLETE")
-    logger.info(f"Time Taken: {total_time:.2f}s ({total_time/len(wells):.2f}s/well)")
-    logger.info(f"Wells Processed: {stats['processed']}")
-    logger.info(f"Failures: {stats['failed']}")
-    logger.info(f"Total Anomalies Detected: {stats['anomalies_found']}")
-    logger.info("="*50)
+    logger.info(f"Execution Time     : {total_time:.2f}s")
+    logger.info(f"Wells Processed   : {stats['processed']}")
+    logger.info(f"Wells Failed      : {stats['failed']}")
+    logger.info(f"Anomalies Saved   : {stats['anomalies_found']}")
+    logger.info("=" * 60)
 
-def insert_anomalies_to_db(results):
-    """
-    Helper to persist results to Snowflake 'well_anomalies' table.
-    """
-    if not results: 
-        return
-    
-    try:
-        conn = get_snowflake_conn()
-        cursor = conn.cursor()
-        
-        insert_data = []
-        for r in results:
-            # Prepare JSON content as string
-            raw_values_json = json.dumps(r['ui_text'])
-            
-            insert_data.append((
-                r['well_id'],
-                str(r['timestamp']), # Convert Timestamp to string
-                r['title'],     # anomaly_type
-                1.0,            # score
-                raw_values_json,  # raw_values as JSON string
-                'Logic_Engine_v2', # model_name
-                'New',          # status
-                r['severity'],
-                r['category']
-            ))
-        
-        if insert_data:
-            # parsing JSON in VALUES clause can be problematic with parameters in standard cursor
-            # Switching to INTO ... SELECT syntax which handles functions on parameters better
-            insert_query = """
-                INSERT INTO well_anomalies 
-                (well_id, timestamp, anomaly_type, anomaly_score, raw_values, 
-                 model_name, status, severity, category)
-                SELECT %s, %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, %s
-            """
-            for row in insert_data:
-                cursor.execute(insert_query, row)
 
-            conn.commit()
-            logger.info(f"✓ Inserted {len(insert_data)} anomalies to Snowflake well_anomalies table.")
-            
-        conn.close()
-    except Exception as e:
-        logger.error(f"DB Insert Failed: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-
+# =====================================================
+# ENTRY POINT
+# =====================================================
 if __name__ == "__main__":
     run_batch()
