@@ -66,30 +66,15 @@ def generate_data(start_date, end_date, scenario):
 
     for count_limit, w_type, initial_rates in well_types:
         for _ in range(count_limit):
-
             w_id = TARGET_WELL_ID if TARGET_WELL_ID else f"Well_{count:03d}_{w_type.replace(' ', '')}"
             qi_o, qi_g, qi_w = initial_rates
             
+            # --- BASELINE PRODUCTION ---
             oil = np.random.normal(qi_o, qi_o * 0.02, len(dates_daily))
             gas = np.random.normal(qi_g, qi_g * 0.05, len(dates_daily))
             water = np.random.normal(qi_w, qi_w * 0.05, len(dates_daily))
 
-            if scenario == "3": oil *= 0.6
-            if scenario == "4": oil *= 0.1
-            if scenario == "5": 
-                oil[:] = 0
-                gas[:] = 0
-                water[:] = 0
-
-            daily_data.append(pd.DataFrame({
-                "WellID": w_id,
-                "Date": dates_daily,
-                "Oil_Volume": np.abs(oil),
-                "Gas_Volume": np.abs(gas),
-                "Water_Volume": np.abs(water),
-                "Lift_Type": w_type
-            }))
-
+            # --- SENSOR BASELINES (HEALTHY) ---
             hf = pd.DataFrame({"WellID": w_id, "Timestamp": dates_hf})
             hf["Surface_Pressure"] = np.random.normal(500, 20, len(dates_hf))
             hf["Casing_Pressure"] = np.random.normal(600, 30, len(dates_hf))
@@ -99,24 +84,54 @@ def generate_data(start_date, end_date, scenario):
                 hf["Strokes_Per_Minute"] = np.random.normal(15, 1, len(dates_hf))
                 hf["Pump_Fillage"] = np.random.normal(90, 5, len(dates_hf))
                 hf["Tubing_Pressure"] = np.random.normal(1200, 50, len(dates_hf))
+                hf["Motor_Current"] = np.random.normal(15, 2, len(dates_hf)) # Add a healthy motor current
 
-            elif w_type == "ESP":
-                hf["Motor_Current"] = np.random.normal(120, 5, len(dates_hf))
-                hf["Discharge_Pressure"] = np.random.normal(2500, 100, len(dates_hf))
-                hf["Pump_Intake_Pressure"] = np.random.normal(500, 30, len(dates_hf))
+            # --- INJECT ANOMALY LOGIC ---
 
-            elif w_type == "Gas Lift":
-                hf["Injection_Rate"] = np.random.normal(10, 1, len(dates_hf))
-                hf["Injection_Pressure"] = np.random.normal(1200, 50, len(dates_hf))
+            # Scenario 2: Pressure Instability
+            if scenario == "2" and "Tubing_Pressure" in hf.columns:
+                print("Injecting: Pressure Instability")
+                # Make pressure bounce wildly
+                hf["Tubing_Pressure"] += np.random.normal(0, 300, len(dates_hf))
+                # Slightly reduce production due to instability
+                oil *= 0.9
 
+            # Scenario 3: Efficiency Degradation (e.g., Tubing Leak)
+            if scenario == "3" and "Tubing_Pressure" in hf.columns:
+                print("Injecting: Efficiency Degradation (Tubing Leak)")
+                # Drop tubing pressure to simulate a leak
+                hf["Tubing_Pressure"] *= 0.5 
+                # Production drops, but motor keeps running normally
+                oil *= 0.4
+
+            # Scenario 4: Production Crash (e.g., Stuck Pump)
+            if scenario == "4" and "Motor_Current" in hf.columns:
+                print("Injecting: Production Crash (Stuck Pump)")
+                # Spike motor current
+                hf["Motor_Current"] *= 2.5
+                # Production drops to almost zero
+                oil *= 0.05
+
+            # Scenario 5: Ghost Production (e.g., Parted Rods)
+            if scenario == "5" and "Motor_Current" in hf.columns:
+                print("Injecting: Ghost Production (Parted Rods)")
+                # Drop motor current (no load)
+                hf["Motor_Current"] *= 0.3
+                # Production goes to zero
+                oil[:] = 0
+                gas[:] = 0
+                water[:] = 0
+            
+            # --- FINALIZE DATA ---
+            daily_data.append(pd.DataFrame({
+                "WellID": w_id, "Date": dates_daily, "Oil_Volume": np.abs(oil),
+                "Gas_Volume": np.abs(gas), "Water_Volume": np.abs(water), "Lift_Type": w_type
+            }))
+            
             hf_data.append(hf)
             count += 1
-
-            if TARGET_WELL_ID:
-                break
-
-        if TARGET_WELL_ID:
-            break
+            if TARGET_WELL_ID: break
+        if TARGET_WELL_ID: break
 
     return pd.concat(daily_data), pd.concat(hf_data)
 

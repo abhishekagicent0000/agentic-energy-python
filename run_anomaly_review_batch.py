@@ -18,7 +18,7 @@ TEST_WELL_LIMIT = 1
 
 # 👉 Run batch for a specific well when testing (highest priority)
 # Set to None to disable
-TEST_WELL_ID = "Well_003_RodPump"  # e.g. "WELL_12345"
+TEST_WELL_ID = "Well_001_RodPump"  # e.g. "WELL_12345"
 
 MAX_WORKERS = 10
 # =====================================================

@@ -27,24 +27,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 5s
-
-  # Optional: Worker service for background pipeline jobs
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: at-risk-assets-worker
-    environment:
-      - SNOWFLAKE_USER=${SNOWFLAKE_USER}
-      - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD}
-      - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT}
-      - SNOWFLAKE_WAREHOUSE=${SNOWFLAKE_WAREHOUSE}
-      - SNOWFLAKE_DATABASE=${SNOWFLAKE_DATABASE}
-      - SNOWFLAKE_SCHEMA=${SNOWFLAKE_SCHEMA}
-      - SNOWFLAKE_ROLE=${SNOWFLAKE_ROLE}
-      - PYTHONUNBUFFERED=1
-    command: python anomaly_pipeline.py
-    restart: unless-stopped
-    depends_on:
-      web:
-        condition: service_healthy
